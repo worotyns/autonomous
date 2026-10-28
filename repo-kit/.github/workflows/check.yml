@@ -1,0 +1,19 @@
+# The gate the board and branch protection use. Fill in any setup steps the repo needs
+# (actions/setup-node, actions/setup-python, services, ...) before `make setup`.
+name: check
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency: { group: "check-${{ github.ref }}", cancel-in-progress: true }
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make setup && make check

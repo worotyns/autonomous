@@ -6,7 +6,7 @@ body:
     id: context
     attributes:
       label: Context
-      description: What is wrong or missing, and why it matters. Links to code, logs, designs.
+      description: What is wrong or missing, and why it matters. Links to code, logs, designs, a failing scenario.
     validations:
       required: true
   - type: textarea
@@ -28,4 +28,7 @@ body:
     id: hints
     attributes:
       label: How to test / hints
-      description: Commands, fixtures, the files to start from.
+      description: Commands, fixtures, files to start from. `make check` is the baseline; installer/systemd/bridge changes need a VM run (see AGENTS.md).
+      value: |
+        1. `make check`
+        2. If this touches install.sh, deploy.sh, systemd/ or bridge.py: a throwaway VM run (or say in the PR why you could not run it).

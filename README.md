@@ -64,7 +64,7 @@ flowchart TB
 | [OpenRouter](https://openrouter.ai) | models, `deepseek/deepseek-v4.1-flash` by default (cheap; one line to change) |
 | `gh` | GitHub CLI |
 | **gh-bridge** (`bridge.py`) | joins issues to the board: `consult`/`start` labels → tasks, issue comments → agent, state → `agent:*` labels, `/approve`, `/stop` |
-| **repo-kit** | for each repo: issue template with acceptance criteria, `AGENTS.md` (Definition of Done), `release.yml` |
+| **repo-kit** | for each repo: issue/PR templates, `AGENTS.md` (Definition of Done), `Makefile`, check + release workflows |
 
 ## TL;DR: VPS setup
 
@@ -90,7 +90,7 @@ Add the repo-kit to each repo (opens a PR, overwrites nothing):
 repo-kit/apply.sh owner/repo1 owner/repo2
 ```
 
-In that PR, fill in the commands (install, check) and a repo map in `AGENTS.md`, and the check command in `.herdr-projects.json`. A cheap model does much better when it doesn't have to guess.
+In that PR, fill in `Makefile` (`setup`, `check`), the commands and a repo map in `AGENTS.md`, and the check command in `.herdr-projects.json`. A cheap model does much better when it doesn't have to guess. The `check.yml` workflow runs the same `make check` as the board and as branch protection.
 
 **Tokens:**
 - `GH_TOKEN`: the token of the account whose comments steer the agent (usually yours). Best fine-grained, only for the chosen repos: Contents, Issues, Pull requests (RW), Actions, Commit statuses, Metadata (R).
@@ -135,7 +135,20 @@ Labels: `agent:consulting` · `agent:working` → (`agent:needs-input`) → `age
 
 **Consult model:** `[consult] agent` in the config or `AUTONOMOUS_CONSULT_AGENT` in `/etc/autonomous/env`, e.g. `pi/openrouter/deepseek/deepseek-v4-pro`. A stronger model than the coding one pays off here: little text, a lot of thinking. The other models (agent, reviewer) are in the `[herdr_projects]` section. `pi --list-models` lists the names.
 
-## Test locally (macOS, Lima)
+## Self-hosting (dogfooding)
+
+autonomous already carries the kit it installs into other repos: `.herdr-projects.json` (`make setup` / `make check`), `AGENTS.md`, the issue/PR templates and the `check` + `release` workflows. To let the agent work on the project itself, add it as a repo:
+
+```toml
+[[repo]]
+name = "worotyns/autonomous"
+```
+
+Then `sudo autonomous update`, open an issue from **Agent task** and add `start`. `make check` is the same gate locally, in CI and before a PR. The calculator sandbox and the end-to-end scenarios are in [tests/README.md](tests/README.md).
+
+## Test locally (macOS/Linux)
+
+macOS with Lima:
 
 ```bash
 brew install lima
@@ -145,7 +158,7 @@ SSH_CONFIG=~/.lima/autonomous/ssh.config.host ./deploy.sh lima-autonomous
 # clean up: limactl delete -f autonomous
 ```
 
-A plain container (Docker/Podman) won't do, because the installer needs systemd. Test scenarios and the pre-push checklist are in [AGENTS.md](AGENTS.md).
+On a Linux host, `scripts/vm.sh` boots the same Ubuntu cloud image with QEMU (KVM when `/dev/kvm` works, TCG otherwise), deploys the installer into it and can run the calculator scenarios in [tests/README.md](tests/README.md). A plain container (Docker/Podman) won't do, because the installer needs systemd. Test scenarios and the pre-push checklist are in [AGENTS.md](AGENTS.md).
 
 ## What's where
 
@@ -158,6 +171,9 @@ A plain container (Docker/Podman) won't do, because the installer needs systemd.
 | `config/` | example config and env; the real ones go to `/etc/autonomous/` |
 | `systemd/` | `herdr.service` (`herdr server`) and `gh-bridge.service` |
 | `repo-kit/` | files for each repo + `apply.sh` |
+| `scripts/vm.sh` | throwaway Ubuntu VM on a Linux host (KVM or TCG) |
+| `tests/` | sandbox test config, calculator end-to-end scenarios |
+| `.github/` | issue/PR templates, `check.yml`, `release.yml` |
 
 On the VPS: config in `/etc/autonomous/`, bridge state in `/var/lib/autonomous/`, repos in `/home/agent/repos/<owner>/<repo>`, worktrees in `/home/agent/.herdr/worktrees/`.
 

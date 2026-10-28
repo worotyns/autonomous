@@ -1,7 +1,10 @@
 # Instructions for coding agents
 
+<!-- apply.sh never overwrites an existing AGENTS.md. If this repo already has one, merge these sections into it. -->
+
 ## Commands
-<!-- Fill in for this repo. Agents run exactly these; keep them fast and non-interactive. -->
+<!-- Fill in for this repo. Agents run exactly these; keep them offline and non-interactive.
+     CI runs `make setup && make check` too. -->
 - Install: `make setup`
 - Check (lint + tests, must pass before you finish): `make check`
 - Run locally: `make run`
@@ -11,7 +14,7 @@
 
 ## Definition of Done
 1. Every acceptance criterion of the issue has a test, or a stated manual proof in the PR description.
-2. `make check` passes locally.
+2. `make check` passes locally (the same command CI and the board run).
 3. The PR description lists the acceptance criteria, ticked, each with how it was verified.
 4. The diff stays inside the issue's scope. Anything else you noticed goes under "Also noticed" in the PR, not in code.
 5. No secrets, no generated files, no unrelated formatting changes.
