@@ -28,4 +28,4 @@ body:
     id: hints
     attributes:
       label: How to test / hints
-      description: Commands, fixtures, the files to start from.
+      description: Commands, fixtures, the files to start from. `make check` is the baseline; say here if a VM, service or special setup is needed.

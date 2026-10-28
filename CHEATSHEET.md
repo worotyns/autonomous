@@ -49,6 +49,7 @@ cp config/env.example config/env                           # OPENROUTER_API_KEY,
 ./deploy.sh root@<server-ip>
 # once on the server: sudo -iu agent; cd ~/repos/<owner>/<repo>; pi; ctrl+c
 repo-kit/apply.sh <owner>/<repo>     # PR with templates; merge it
+# dogfooding: [[repo]] name = "worotyns/autonomous" in autonomous.toml, then sudo autonomous update
 ```
 
 ## On the server (`ssh root@<server-ip>`)

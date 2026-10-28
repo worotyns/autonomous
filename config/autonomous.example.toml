@@ -43,3 +43,7 @@ name = "acme/api"
 name = "acme/web"
 # settings = { "worker.agent" = "pi/openrouter/<other-model>" }   # per-task flags for this repo's tasks
 # repo_settings = { "check.command" = "make check" }              # `herdr-projects set ... --repo <path>`
+
+# Self-hosting (dogfooding): let the agent work on autonomous itself.
+# [[repo]]
+# name = "worotyns/autonomous"

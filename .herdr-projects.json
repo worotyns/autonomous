@@ -1,0 +1,4 @@
+{
+  "check": { "command": "make check", "timeout": "5m" },
+  "workspace": { "setup": "make setup" }
+}

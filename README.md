@@ -59,12 +59,12 @@ flowchart TB
 | Part | Role |
 |---|---|
 | [herdr](https://herdr.dev) | terminal server for agents: sessions live in the background, you can attach over SSH and watch an agent |
-| [herdr-projects](https://github.com/eliasstravik/herdr-projects) | herdr plugin: board, multi-repo, a worktree per task, check, draft PR, review by a second agent, merge only after approval, reacts to PR comments, `--chat` mode (consults) |
+| [herdr-projects](https://github.com/eliasstravik/herdr-projects) | herdr plugin: board, multi-repo, a worktree per task, check, draft PR, review by a second agent, merge only after approval, reacts to PR comments, `--chat` mode (consults). Pinned to 1.2.27: its successor Shepherdr 2.0 renamed the CLI and data dir, and the bridge speaks 1.2.x |
 | [pi](https://github.com/earendil-works/pi) | the coding agent |
 | [OpenRouter](https://openrouter.ai) | models, `deepseek/deepseek-v4.1-flash` by default (cheap; one line to change) |
 | `gh` | GitHub CLI |
 | **gh-bridge** (`bridge.py`) | joins issues to the board: `consult`/`start` labels → tasks, issue comments → agent, state → `agent:*` labels, `/approve`, `/stop` |
-| **repo-kit** | for each repo: issue template with acceptance criteria, `AGENTS.md` (Definition of Done), `release.yml` |
+| **repo-kit** | for each repo: issue/PR templates, `AGENTS.md` (Definition of Done), `Makefile`, check + release workflows |
 
 ## TL;DR: VPS setup
 
@@ -90,7 +90,7 @@ Add the repo-kit to each repo (opens a PR, overwrites nothing):
 repo-kit/apply.sh owner/repo1 owner/repo2
 ```
 
-In that PR, fill in the commands (install, check) and a repo map in `AGENTS.md`, and the check command in `.herdr-projects.json`. A cheap model does much better when it doesn't have to guess.
+In that PR, fill in `Makefile` (`setup`, `check`), the commands and a repo map in `AGENTS.md`, and the check command in `.herdr-projects.json`. A cheap model does much better when it doesn't have to guess. The `check.yml` workflow runs the same `make check` as the board and as branch protection.
 
 **Tokens:**
 - `GH_TOKEN`: the token of the account whose comments steer the agent (usually yours). Best fine-grained, only for the chosen repos: Contents, Issues, Pull requests (RW), Actions, Commit statuses, Metadata (R).
@@ -135,17 +135,45 @@ Labels: `agent:consulting` · `agent:working` → (`agent:needs-input`) → `age
 
 **Consult model:** `[consult] agent` in the config or `AUTONOMOUS_CONSULT_AGENT` in `/etc/autonomous/env`, e.g. `pi/openrouter/deepseek/deepseek-v4-pro`. A stronger model than the coding one pays off here: little text, a lot of thinking. The other models (agent, reviewer) are in the `[herdr_projects]` section. `pi --list-models` lists the names.
 
-## Test locally (macOS, Lima)
+## Self-hosting (dogfooding)
+
+autonomous already carries the kit it installs into other repos: `.herdr-projects.json` (`make setup` / `make check`), `AGENTS.md`, the issue/PR templates and the `check` + `release` workflows. To let the agent work on the project itself, add it as a repo:
+
+```toml
+[[repo]]
+name = "worotyns/autonomous"
+```
+
+Then `sudo autonomous update`, open an issue from **Agent task** and add `start`. `make check` is the same gate locally, in CI and before a PR.
+
+The fast end-to-end loop is a privileged systemd Docker container, no KVM needed:
+
+```bash
+tests/docker.sh up                 # install autonomous into a throwaway systemd container
+tests/docker.sh scenario work      # the calculator sandbox: issue -> PR -> review -> /approve -> release
+tests/docker.sh down
+```
+
+The container runs the same `repo-kit`/`make check` as the sandbox repos. That is the inception loop: autonomous develops autonomous, and the container proves the kit on a calculator before a real PR. The calculator sandbox and all scenarios are in [tests/README.md](tests/README.md).
+
+## Test locally (macOS/Linux)
+
+macOS with Lima:
 
 ```bash
 brew install lima
 limactl start --name=autonomous --tty=false --cpus=4 --memory=4 --disk=20 --mount-none template:ubuntu-24.04
-limactl show-ssh --format=config autonomous | sed 's/^Host .*/Host lima-autonomous/' > ~/.lima/autonomous/ssh.config.host
-SSH_CONFIG=~/.lima/autonomous/ssh.config.host ./deploy.sh lima-autonomous
+# Lima writes the SSH config to ~/.lima/autonomous/ssh.config
+SSH_CONFIG=~/.lima/autonomous/ssh.config ./deploy.sh lima-autonomous
 # clean up: limactl delete -f autonomous
 ```
 
-A plain container (Docker/Podman) won't do, because the installer needs systemd. Test scenarios and the pre-push checklist are in [AGENTS.md](AGENTS.md).
+On a Linux host there are two paths:
+
+- **Docker (fast, no KVM):** `tests/docker.sh up` runs a privileged Ubuntu + systemd container, so `install.sh`, `loginctl` and the systemd services work at native speed. It is a container, not a VM; use sandbox repos and `tests/docker.sh down` when done.
+- **VM (release-grade):** `scripts/vm.sh` boots an Ubuntu cloud image with QEMU (KVM when `/dev/kvm` works, TCG otherwise), or use Lima when KVM is available. A plain container without systemd won't do.
+
+The calculator scenarios, Docker details and the pre-push checklist are in [tests/README.md](tests/README.md) and [AGENTS.md](AGENTS.md).
 
 ## What's where
 
@@ -158,6 +186,11 @@ A plain container (Docker/Podman) won't do, because the installer needs systemd.
 | `config/` | example config and env; the real ones go to `/etc/autonomous/` |
 | `systemd/` | `herdr.service` (`herdr server`) and `gh-bridge.service` |
 | `repo-kit/` | files for each repo + `apply.sh` |
+| `scripts/vm.sh` | throwaway Ubuntu VM on a Linux host (KVM or TCG) |
+| `tests/docker.sh` | privileged systemd container: fast local e2e, no KVM |
+| `tests/docker/` | Dockerfile for that container |
+| `tests/` | sandbox test config, calculator end-to-end scenarios |
+| `.github/` | issue/PR templates, `check.yml`, `release.yml` |
 
 On the VPS: config in `/etc/autonomous/`, bridge state in `/var/lib/autonomous/`, repos in `/home/agent/repos/<owner>/<repo>`, worktrees in `/home/agent/.herdr/worktrees/`.
 
@@ -172,4 +205,5 @@ On the VPS: config in `/etc/autonomous/`, bridge state in `/var/lib/autonomous/`
 
 - Labels catch up with a merge on the next poll (up to ~60 s).
 - `release.yml` tags every push to `main`, including commits not made by agents (`release:none` on the PR turns it off).
-- Checked on Ubuntu 24.04 arm64 (Lima). x86 should work the same (the herdr and herdr-projects installers support both), but I haven't tested it.
+- Checked on Ubuntu 24.04 x86_64 in a privileged systemd Docker container (install + `work` scenario end-to-end) and on arm64 with Lima. x86_64 Lima should work the same.
+- The board plugin is pinned to herdr-projects 1.2.27. Shepherdr 2.0 replaced it with a new CLI (`shepherdr`) and data dir (`~/.shepherdr`); migrating `bridge.py`/`install.sh` is a separate task.

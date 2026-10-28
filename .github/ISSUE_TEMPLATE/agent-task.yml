@@ -1,0 +1,34 @@
+name: Agent task
+description: Work for a coding agent. Add the `start` label to hand it over.
+title: "<short imperative title>"
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What is wrong or missing, and why it matters. Links to code, logs, designs, a failing scenario.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: One checkbox per verifiable outcome. The agent writes a test (or a stated proof) for each one.
+      value: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What the agent must not change.
+  - type: textarea
+    id: hints
+    attributes:
+      label: How to test / hints
+      description: Commands, fixtures, files to start from. `make check` is the baseline; installer/systemd/bridge changes need a VM run (see AGENTS.md).
+      value: |
+        1. `make check`
+        2. If this touches install.sh, deploy.sh, systemd/ or bridge.py: a throwaway VM run (or say in the PR why you could not run it).
