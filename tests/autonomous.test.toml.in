@@ -1,0 +1,32 @@
+# Test config for the throwaway VM. scripts/vm.sh substitutes the two sandbox repos.
+# Keep this config to sandbox repos only: the VM agent must never touch a real project.
+[bridge]
+poll_interval = 20
+quiet_window  = 20
+
+[github]
+start_label = "start"
+
+[consult]
+label = "consult"
+agent = ""
+
+[git]
+name  = "autonomous test"
+email = "you@example.com"
+
+[herdr_projects]
+"worker.agent"      = "pi/openrouter/deepseek/deepseek-v4.1-flash"
+"reviewer.agent"    = "pi/openrouter/deepseek/deepseek-v4.1-flash"
+"watcher.agent"     = "pi/openrouter/deepseek/deepseek-v4.1-flash"
+"coordinator.agent" = "pi/openrouter/deepseek/deepseek-v4.1-flash"
+"merge.by"          = "you"
+"merge.checks"      = "github"
+"review.rounds"     = "3"
+"limit.time"        = "30m"
+
+[[repo]]
+name = "{{REPO_A}}"
+
+[[repo]]
+name = "{{REPO_B}}"
