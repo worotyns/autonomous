@@ -18,6 +18,8 @@ flowchart LR
     M --> T[release.yml:<br/>tag vX.Y.Z → release → obraz GHCR]
 ```
 
+Początkujesz? Zacznij od **[CHEATSHEET.md](CHEATSHEET.md)** (jedna kartka A4).
+
 Przetestowane end-to-end na Ubuntu 24.04 (Lima VM, arm64), na dwóch repo:
 - zadania równolegle,
 - agent pyta → Ty odpowiadasz w issue,
@@ -124,9 +126,9 @@ sequenceDiagram
 | zmergować | `/approve` w issue (albo merge ręcznie, też zadziała) |
 | zatrzymać | `/stop` w issue |
 | typ wersji | label na PR: `release:minor`, `release:major`, `release:none` (domyślnie patch) |
-| podejrzeć agenta na żywo | `ssh` → `sudo -iu agent` → `herdr`; board: `ctrl+b a`, wyjście: `ctrl+b q` |
-| status / logi | `sudo -iu agent /usr/local/bin/uv run --script /opt/autonomous/bridge.py status`, `journalctl -u gh-bridge -f` |
-| dodać repo | `[[repo]]` w `/etc/autonomous/autonomous.toml` → `sudo bash /opt/autonomous/install.sh` |
+| podejrzeć agenta na żywo | `sudo autonomous attach`; board: `ctrl+b a`, wyjście: `ctrl+b q` |
+| status / logi / zdrowie | `sudo autonomous status`, `sudo autonomous logs`, `sudo autonomous doctor` |
+| dodać repo | `[[repo]]` w `/etc/autonomous/autonomous.toml` → `sudo autonomous update` |
 | aktualizacja | `./deploy.sh <host>` jeszcze raz (idempotentny, nie rusza configu w `/etc/autonomous`) |
 
 Labele: `agent:consulting` · `agent:working` → (`agent:needs-input`) → `agent:ready` → `agent:done`, albo `agent:failed`.
@@ -143,7 +145,7 @@ SSH_CONFIG=~/.lima/autonomous/ssh.config.host ./deploy.sh lima-autonomous
 # sprzątanie: limactl delete -f autonomous
 ```
 
-Zwykły kontener (Docker/Podman) się nie nada, bo instalator potrzebuje systemd.
+Zwykły kontener (Docker/Podman) się nie nada, bo instalator potrzebuje systemd. Scenariusze testowe i checklista przed pushem są w [AGENTS.md](AGENTS.md).
 
 ## Co gdzie leży
 
@@ -151,7 +153,7 @@ Zwykły kontener (Docker/Podman) się nie nada, bo instalator potrzebuje systemd
 |---|---|
 | `deploy.sh` | z laptopa: rsync do `/opt/autonomous` + `install.sh` na serwerze |
 | `install.sh` | instalator: pakiety, user `agent`, herdr + plugin, pi, repo, labele, ustawienia boardu, usługi systemd |
-| `bridge.py` | gh-bridge (Python, sama biblioteka standardowa): `run`, `once`, `status`, `doctor`, `sync-repos`, `apply-settings`, `notify` |
+| `bridge.py` | gh-bridge (Python, sama biblioteka standardowa); na serwerze przez `sudo autonomous doctor\|status\|logs\|attach\|restart\|update` |
 | `prompts/` | brief zadania i konsultacji, wiadomości z komentarzami z issue |
 | `config/` | przykładowy config i env; prawdziwe lądują w `/etc/autonomous/` |
 | `systemd/` | `herdr.service` (`herdr server`) i `gh-bridge.service` |

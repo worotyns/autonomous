@@ -161,6 +161,24 @@ if [ -n "${GH_TOKEN:-}" ]; then
   as_agent "$BRIDGE apply-settings" || true
 fi
 
+step "autonomous command"
+cat > /usr/local/bin/autonomous <<'EOF'
+#!/bin/sh
+# Short commands for the box. Run with sudo: sudo autonomous <doctor|status|logs|attach|restart|update>
+case "${1:-help}" in
+  logs)    exec journalctl -u gh-bridge -u herdr -f ;;
+  restart) exec systemctl restart herdr gh-bridge ;;
+  update)  exec bash /opt/autonomous/install.sh ;;
+  attach)  exec sudo -iu agent herdr ;;
+  doctor|status|once|sync-repos|apply-settings)
+    exec sudo -u agent -H sh -c 'cd ~ && export PATH="$HOME/.herdr-projects/data/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" &&
+      set -a && . /etc/autonomous/env && set +a &&
+      exec /usr/local/bin/uv run --script /opt/autonomous/bridge.py "$@"' sh "$@" ;;
+  *) echo "usage: sudo autonomous doctor|status|logs|attach|restart|update"; exit 2 ;;
+esac
+EOF
+chmod 755 /usr/local/bin/autonomous
+
 step "gh-bridge"
 if [ ${#MISSING[@]} -eq 0 ]; then
   systemctl enable gh-bridge.service >/dev/null 2>&1
@@ -170,7 +188,7 @@ else
 fi
 
 step "Doctor"
-as_agent "$BRIDGE doctor" || true
+/usr/local/bin/autonomous doctor || true
 
 if [ ${#MISSING[@]} -gt 0 ]; then
   printf '\n\033[1;33mStill to do:\033[0m\n'; printf '  - %s\n' "${MISSING[@]}"
@@ -183,6 +201,5 @@ Next, once (pi's first run, the board asks for it):
   cd ~/repos/<owner>/<repo> && pi      # check it starts, the model answers, then quit
   herdr                                 # attach; the board: ctrl+b a
 
-Logs:   journalctl -u gh-bridge -f     journalctl -u herdr -f
-State:  sudo -iu $USER_NAME $BRIDGE status
+Then:   sudo autonomous doctor | status | logs | attach | restart | update
 EOF
