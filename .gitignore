@@ -1,0 +1,4 @@
+config/env
+config/autonomous.toml
+*.db
+__pycache__/

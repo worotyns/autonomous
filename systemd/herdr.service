@@ -1,0 +1,25 @@
+[Unit]
+Description=herdr server (agents for user agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/home/agent
+# Same runtime dir an SSH login of `agent` gets (linger keeps it), so `herdr` in a shell finds this server.
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=HOME=/home/agent
+Environment=PATH=/home/agent/.herdr-projects/data/bin:/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/autonomous/env
+ExecStart=@HERDR@ server
+ExecStop=@HERDR@ server stop
+Restart=on-failure
+RestartSec=5
+# Agents are children of the server: stop them with it, herdr restores sessions on start.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,39 @@
+# /etc/autonomous/autonomous.toml — copied from this file on first install, never overwritten.
+# After editing: sudo systemctl restart gh-bridge   (repos/settings: sudo bash /opt/autonomous/install.sh)
+
+[bridge]
+poll_interval = 60          # seconds between GitHub polls
+quiet_window  = 90          # wait this long after the last issue comment before passing comments to the agent
+# repos_dir      = "/home/agent/repos"
+# herdr_projects = "/home/agent/.herdr-projects/data/bin/herdr-projects"
+
+[github]
+start_label   = "start"
+# Who may start an agent and talk to it in issues. The gh user on the VPS is always allowed.
+# herdr-projects itself only lets PR comments of the gh user wake the agent.
+allow_authors = []          # e.g. ["teammate-login"]
+
+[git]
+name  = "Your Name (agent)"
+email = "you@example.com"
+
+# herdr-projects settings, applied with `herdr-projects set <key> <value>` (docs/settings.md in herdr-projects).
+# Model names: `pi --list-models` on the VPS.
+[herdr_projects]
+"worker.agent"      = "pi/openrouter/deepseek/deepseek-v4.1-flash"
+"reviewer.agent"    = "pi/openrouter/deepseek/deepseek-v4.1-flash"   # worth a stronger model: reviews are short
+"watcher.agent"     = "pi/openrouter/deepseek/deepseek-v4.1-flash"
+"coordinator.agent" = "pi/openrouter/deepseek/deepseek-v4.1-flash"
+"merge.by"          = "you"       # nothing merges without /approve (issue) or the board
+"merge.checks"      = "github"    # and only once GitHub checks are green
+"review.rounds"     = "3"
+"limit.time"        = "2h"
+
+# One block per repo. `path` defaults to <repos_dir>/<owner>/<name>.
+[[repo]]
+name = "acme/api"
+
+[[repo]]
+name = "acme/web"
+# settings = { "worker.agent" = "pi/openrouter/<other-model>" }   # per-task flags for this repo's tasks
+# repo_settings = { "check.command" = "make check" }              # `herdr-projects set ... --repo <path>`

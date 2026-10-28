@@ -1,0 +1,4 @@
+{
+  "check": { "command": "make check" },
+  "workspace": { "setup": "make setup" }
+}
