@@ -13,6 +13,12 @@ start_label   = "start"
 # herdr-projects itself only lets PR comments of the gh user wake the agent.
 allow_authors = []          # e.g. ["teammate-login"]
 
+[consult]
+label = "consult"           # label for a no-code consultation on an issue; add `start` afterwards to build it
+# The consult agent. Empty = worker.agent. Worth a stronger model: little text, a lot of thinking.
+# The env var AUTONOMOUS_CONSULT_AGENT (in /etc/autonomous/env) overrides this.
+agent = ""
+
 [git]
 name  = "Your Name (agent)"
 email = "you@example.com"

@@ -5,7 +5,8 @@
 # ///
 """gh-bridge: GitHub issues <-> herdr-projects board, for many repos.
 
-  label `start` on an issue      -> herdr-projects add ... --merge.closes N --delegate
+  label `consult` on an issue    -> herdr-projects add ... --chat     (talks about the code, changes nothing)
+  label `start` on an issue      -> herdr-projects add ... --merge.closes N --delegate  (ends a running consult)
   comment on that issue          -> herdr-projects tell <task> "..."   (/approve, /stop handled as commands)
   board state (notify + polling) -> agent:* labels and status comments on the issue
 
@@ -33,6 +34,7 @@ MARK = "<!-- autonomous -->"            # every comment the bridge writes carrie
 MARK_PREFIX = "<!-- autonomous"         # ...and the agent is told to add <!-- autonomous:agent -->
 
 LABELS = {
+    "agent:consulting": ("c5def5", "An agent discusses this issue with you, no code yet"),
     "agent:working": ("fbca04", "An agent is working on this"),
     "agent:needs-input": ("d93f0b", "The agent asked a question: answer in a comment"),
     "agent:ready": ("0e8a16", "Reviewed PR waits for approval"),
@@ -67,6 +69,10 @@ def load_config() -> dict:
     g = cfg.setdefault("github", {})
     g.setdefault("start_label", "start")
     g.setdefault("allow_authors", [])
+    k = cfg.setdefault("consult", {})
+    k.setdefault("label", "consult")
+    # the consult agent; empty = the board's worker.agent. AUTONOMOUS_CONSULT_AGENT overrides the config.
+    k["agent"] = os.environ.get("AUTONOMOUS_CONSULT_AGENT") or k.get("agent", "")
     for r in cfg.setdefault("repo", []):
         r.setdefault("path", str(Path(b["repos_dir"]) / r["name"]))
     return cfg
@@ -149,7 +155,10 @@ def db() -> sqlite3.Connection:
     c.row_factory = sqlite3.Row
     c.execute("""create table if not exists tasks(
         repo text, issue integer, task_id text unique, state text, label text,
-        cursor text, created_at text, updated_at text, board_state text, primary key(repo, issue))""")
+        cursor text, created_at text, updated_at text, board_state text, kind text default 'work',
+        primary key(repo, issue))""")
+    if "kind" not in [r[1] for r in c.execute("pragma table_info(tasks)")]:  # a db from before consult mode
+        c.execute("alter table tasks add column kind text default 'work'")
     return c
 
 
@@ -193,40 +202,71 @@ def notes_for(label: str, task: dict, repo: str, task_id: str) -> str:
 
 # ---------------------------------------------------------------- the three jobs
 
+def labeled_by(repo: str, n: int, label: str) -> str:
+    who = run(["gh", "api", "--paginate", f"repos/{repo}/issues/{n}/events",
+               "--jq", f'.[] | select(.event=="labeled" and .label.name=="{label}") | .actor.login']).split()
+    return who[-1] if who else ""
+
+
+def start_task(cfg: dict, c, r: dict, i: dict, kind: str):
+    repo, n = r["name"], i["number"]
+    start, consult = cfg["github"]["start_label"], cfg["consult"]["label"]
+    body = dict(repo=repo, number=n, title=i["title"], url=i["html_url"], body=i.get("body") or "(no description)")
+    settings = [a for k, v in r.get("settings", {}).items() for a in (f"--{k}", str(v))]
+    if kind == "consult":
+        if cfg["consult"]["agent"]:
+            settings += ["--worker.agent", cfg["consult"]["agent"]]
+        args = ["--desc", render("consult_from_issue.md", **body), "--chat", "--delegate"]
+        label, hello = "agent:consulting", ("🧠 Consulting on this: board task `{id}`. The agent reads the code and answers "
+                                            f"here; it changes nothing. Comment to discuss. Add `{start}` when the issue is ready to build.")
+    else:
+        args = ["--desc", render("task_from_issue.md", **body), "--merge.closes", str(n), "--delegate"]
+        label, hello = "agent:working", ("🤖 On it: board task `{id}`. Comment here to talk to the agent; "
+                                         "PR review comments go to it too.")
+    out = hp(cfg, "add", f"{i['title']} (#{n})", "--repo", r["path"], *args, *settings)
+    task_id = out.get("id") if isinstance(out, dict) else None
+    if not task_id:
+        m = re.match(r"(\S+):", out.get("raw", "")) if isinstance(out, dict) else None
+        task_id = m.group(1) if m else None
+    if not task_id:
+        raise RuntimeError(f"herdr-projects add gave no id: {out}")
+    c.execute("insert or replace into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
+              " values(?,?,?,?,?,?,?,?,?,?)", (repo, n, task_id, "working", label, now_iso(), now_iso(), now_iso(), "working/", kind))
+    set_label(repo, n, label, also_remove=(start,) if kind == "work" else (consult,))
+    comment(repo, n, hello.format(id=task_id))
+    log(f"{repo}#{n}: started {kind} {task_id}")
+
+
+def end_consult(cfg: dict, c, row):
+    hp(cfg, "report", row["task_id"], "--state", "done", "--msg", "Handed over to a work task (label start)", check=False)
+    c.execute("update tasks set state='closed', updated_at=? where task_id=?", (now_iso(), row["task_id"]))
+    log(f"{row['repo']}#{row['issue']}: consult {row['task_id']} ended")
+
+
 def pick_up_issues(cfg: dict, c):
-    start = cfg["github"]["start_label"]
+    start, consult = cfg["github"]["start_label"], cfg["consult"]["label"]
     ok = allowed(cfg)
     for r in cfg["repo"]:
         repo = r["name"]
-        issues = gh_api(f"repos/{repo}/issues?labels={start}&state=open&per_page=100")
-        for i in issues:
-            if "pull_request" in i or active(c, repo, i["number"]):
-                continue
-            n = i["number"]
-            who = run(["gh", "api", "--paginate", f"repos/{repo}/issues/{n}/events",
-                       "--jq", f'.[] | select(.event=="labeled" and .label.name=="{start}") | .actor.login']).split()
-            who = who[-1] if who else ""
-            if who.lower() not in ok:
-                set_label(repo, n, None, also_remove=(start,))
-                comment(repo, n, f"🤖 `{start}` was added by @{who}, who is not on the allowlist. Ignored.")
-                log(f"{repo}#{n}: rejected label from {who}")
-                continue
-            desc = render("task_from_issue.md", repo=repo, number=n, title=i["title"],
-                          url=i["html_url"], body=i.get("body") or "(no description)")
-            settings = [a for k, v in r.get("settings", {}).items() for a in (f"--{k}", str(v))]
-            out = hp(cfg, "add", f"{i['title']} (#{n})", "--repo", r["path"], "--desc", desc,
-                     "--merge.closes", str(n), "--delegate", *settings)
-            task_id = out.get("id") if isinstance(out, dict) else None
-            if not task_id:
-                m = re.match(r"(\S+):", out.get("raw", "")) if isinstance(out, dict) else None
-                task_id = m.group(1) if m else None
-            if not task_id:
-                raise RuntimeError(f"herdr-projects add gave no id: {out}")
-            c.execute("insert or replace into tasks values(?,?,?,?,?,?,?,?,?)",
-                      (repo, n, task_id, "working", "agent:working", now_iso(), now_iso(), now_iso(), "working/"))
-            set_label(repo, n, "agent:working", also_remove=(start,))
-            comment(repo, n, f"🤖 On it: board task `{task_id}`. Comment here to talk to the agent; PR review comments go to it too.")
-            log(f"{repo}#{n}: started {task_id}")
+        for label, kind in ((consult, "consult"), (start, "work")):
+            for i in gh_api(f"repos/{repo}/issues?labels={label}&state=open&per_page=100"):
+                n, names = i["number"], {l["name"] for l in i.get("labels", [])}
+                if "pull_request" in i or (kind == "consult" and start in names):
+                    continue  # both labels: go straight to work
+                row = active(c, repo, n)
+                if row and (row["kind"] == kind or kind == "consult"):
+                    continue  # already running; a consult label never interrupts work
+                who = labeled_by(repo, n, label)
+                if who.lower() not in ok:
+                    set_label(repo, n, row["label"] if row else None, also_remove=(label,))
+                    comment(repo, n, f"🤖 `{label}` was added by @{who}, who is not on the allowlist. Ignored.")
+                    log(f"{repo}#{n}: rejected {label} from {who}")
+                    continue
+                if row:  # a consult is running and `start` arrived: the issue is ready to build
+                    end_consult(cfg, c, row)
+                    run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", consult], check=False)
+                    i = gh_api(f"repos/{repo}/issues/{n}")  # the body the consult may have rewritten
+                start_task(cfg, c, r, i, kind)
 
 
 def deliver_comments(cfg: dict, c):
@@ -247,7 +287,8 @@ def deliver_comments(cfg: dict, c):
             else:
                 texts.append(f"@{x['user']['login']}: {body}")
         if texts:
-            hp(cfg, "tell", tid, render("issue_comment.md", repo=repo, number=n, comments="\n\n".join(texts)))
+            prompt = "consult_comment.md" if row["kind"] == "consult" else "issue_comment.md"
+            hp(cfg, "tell", tid, render(prompt, repo=repo, number=n, comments="\n\n".join(texts)))
             log(f"{repo}#{n}: told {tid} {len(texts)} comment(s)")
         c.execute("update tasks set cursor=? where task_id=?", (new[-1]["created_at"], tid))
 
@@ -266,6 +307,13 @@ def sync_states(cfg: dict, c):
         if seen == row["board_state"]:
             continue
         c.execute("update tasks set board_state=? where task_id=?", (seen, row["task_id"]))
+        if row["kind"] == "consult":  # every turn end is `blocked` there: that is the conversation, not a question
+            if state == "done":
+                apply_state(c, row["task_id"], None, state="closed")
+            else:
+                apply_state(c, row["task_id"], "agent:failed" if state == "error" else "agent:consulting",
+                            notes_for("agent:failed", t, row["repo"], row["task_id"]) if state == "error" else "")
+            continue
         label = "agent:ready" if (state, stage) == ("blocked", "approval") else STATE_TO_LABEL.get(state)
         if label is None:
             continue
@@ -297,8 +345,8 @@ def cmd_notify(cfg):
     label = EVENT_TO_LABEL.get(event)
     c = db()
     row = c.execute("select * from tasks where task_id=?", (tid,)).fetchone()
-    if not label or not row:
-        return  # a task not started from GitHub
+    if not label or not row or (row["kind"] == "consult" and event != "failed"):
+        return  # a task not started from GitHub, or a consult's turn end (the agent answers on the issue itself)
     t = next((x for x in hp(cfg, "list", "--all") if isinstance(x, dict) and x.get("id") == tid), {})
     apply_state(c, tid, label, notes_for(label, t, row["repo"], tid))
 
@@ -317,7 +365,9 @@ def cmd_sync_repos(cfg):
             log(f"cloned {r['name']} -> {p}")
         else:
             run(["git", "-C", str(p), "fetch", "--prune", "--quiet"], check=False)
-        for name, (color, desc) in {**LABELS, cfg["github"]["start_label"]: ("1d76db", "Start an agent on this issue")}.items():
+        extra = {cfg["github"]["start_label"]: ("1d76db", "Start an agent on this issue"),
+                 cfg["consult"]["label"]: ("bfd4f2", "Discuss this issue with an agent before building it")}
+        for name, (color, desc) in {**LABELS, **extra}.items():
             run(["gh", "label", "create", name, "--repo", r["name"], "--color", color, "--description", desc, "--force"], check=False)
     log(f"{len(cfg['repo'])} repos in place, labels ensured")
 
