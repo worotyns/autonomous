@@ -1,13 +1,48 @@
 # End-to-end tests on a Linux host
 
-The project is tested against **private sandbox repos**, never real projects. On a Linux host use Lima when
-it is installed, or the raw-QEMU fallback `scripts/vm.sh` when it is not. On macOS the Lima path in
-[AGENTS.md](../AGENTS.md) still applies.
+The project is tested against **private sandbox repos**, never real projects. On this Linux host the fast loop is
+**Docker with systemd** (`tests/docker.sh`): native speed, no KVM, same `install.sh` and systemd services. Use a
+real VM (Lima/QEMU) when KVM is available or before a release, because a container shares the host kernel.
+On macOS the Lima path in [AGENTS.md](../AGENTS.md) applies.
 
-> Docker Sandboxes (`sbx`) is **not** a replacement here. `sbx diagnose` reports no hypervisor on this host
-> (`/dev/kvm` missing), so local sandboxes cannot start. Cloud sandboxes (`sbx --cloud`) are agent containers,
-> not a systemd VM, and the installer needs systemd + `loginctl`. Use `sbx` to run an agent in isolation, not
-> to test `install.sh`.
+> Docker Sandboxes (`sbx`) is **not** the same thing and is **not** a replacement here. `sbx diagnose` reports no
+> hypervisor on this host (`/dev/kvm` missing), so local sandboxes cannot start. Cloud sandboxes (`sbx --cloud`)
+> are agent containers, not a systemd VM. The Docker path below is a plain privileged container with systemd,
+> which is enough for this installer; `sbx` is not.
+
+## Docker (fast, no KVM)
+
+`tests/docker.sh` builds `tests/docker/Dockerfile` (Ubuntu 24.04 + systemd + logind), starts it with
+`--privileged --cgroupns=host` and a writable `/sys/fs/cgroup`, copies this checkout + the sandbox test config,
+and runs `install.sh` inside it. `loginctl enable-linger` and the systemd units work; the kernel is the host's.
+
+```bash
+tests/docker.sh up                 # build + start + install; a few minutes
+tests/docker.sh scenario work      # full issue -> PR -> review -> /approve -> merge -> release
+tests/docker.sh logs               # gh-bridge + herdr logs
+tests/docker.sh shell              # shell in the container
+tests/docker.sh down               # remove the container (and its token/keys)
+```
+
+`tests/docker.sh` retries through `sg docker` if the current shell predates the `docker` group. The test config
+is the same `tests/autonomous.test.toml.in` as the VM path: only the two sandbox repos, 20 s poll/quiet window,
+`limit.time = 30m`. Secrets come from `/etc/autonomous/env` (or `config/env`) and never leave the host/container
+pair.
+
+Verified on this host (Ubuntu 24.04 x86_64): `tests/docker.sh up` + `tests/docker.sh scenario work` passes
+end-to-end in a few minutes, including the release tag. The same command is the inception smoke test: the container
+uses autonomous' own `install.sh`, repo-kit and `make check`.
+
+The container runs the same repo-kit as the sandbox repos and the same `make check`. That is the inception loop:
+autonomous develops autonomous, and the Docker sandbox proves the kit on a calculator before a real PR.
+
+Why it works: a **privileged systemd container** is not a plain app container. The installer needs
+`loginctl enable-linger`, user managers and system services; with systemd as PID 1, cgroup delegation and
+`/run` tmpfs, all of that works. A plain `docker run ubuntu` does not.
+
+**Safety:** `--privileged` gives the container host-level power, and the test agent has a shell in it. Use it
+only with private sandbox repos and test tokens; `tests/docker.sh down` removes the container and its data. For
+a release-grade check use the VM path.
 
 ## 1. VM with Lima
 
@@ -134,9 +169,13 @@ Timeouts are generous because TCG is slow: `READY_TIMEOUT=2400` (40 min), `MERGE
 | `pr-comment` | a PR comment creates a new commit, the task returns to `agent:ready`, merge, `mod` on `main` |
 | `parallel` | both issues are `agent:working` at the same time, both PRs become ready, both merge |
 
-While it runs, watch the VM:
+While it runs, watch the environment:
 
 ```bash
+# Docker
+tests/docker.sh status
+tests/docker.sh logs
+
 # Lima
 ssh -F ~/.lima/autonomous/ssh.config lima-autonomous 'sudo autonomous status'
 ssh -F ~/.lima/autonomous/ssh.config lima-autonomous 'sudo -iu agent herdr-projects list --json'
@@ -149,7 +188,9 @@ scripts/vm.sh ssh 'sudo -iu agent herdr-projects list --json'
 
 ## 7. Safety
 
-- Only private sandbox repos are in the VM config. The script never creates issues in `worotyns/autonomous`.
-- The VM gets the same `GH_TOKEN` and `OPENROUTER_API_KEY` as the live host; treat the VM as trusted and
-  delete it when it is not needed.
-- The VM's agent has a full shell inside the VM only. Do not put production secrets in the sandbox repos.
+- Only private sandbox repos are in the test config. The script never creates issues in `worotyns/autonomous`.
+- The test environment gets the same `GH_TOKEN` and `OPENROUTER_API_KEY` as the live host; treat it as trusted
+  and delete it when it is not needed.
+- The Docker container is `--privileged` and shares the host kernel; its agent has a full shell in the
+  container. Do not put production secrets in the sandbox repos.
+- The VM path isolates better; use it for a release-grade check.

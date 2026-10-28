@@ -120,17 +120,34 @@ systemctl enable --now herdr.service
 systemctl restart herdr.service   # picks up a changed env/unit
 for _ in $(seq 30); do as_agent "herdr workspace list" >/dev/null 2>&1 && break; sleep 1; done
 
-step "herdr-projects plugin"
-if ! as_agent "herdr plugin list" 2>/dev/null | grep -q herdr-projects; then
-  as_agent "herdr plugin install eliasstravik/herdr-projects --yes"
+step "herdr-projects plugin (1.2.x; autonomous does not speak Shepherdr 2.0 yet)"
+# Shepherdr 2.0 replaced herdr-projects with a new command (`shepherdr`) and data dir (`~/.shepherdr`).
+# autonomous' bridge still speaks the 1.2.x CLI, so pin it. Override with HERDR_PROJECTS_REF in /etc/autonomous/env.
+HERDR_PROJECTS_REF=${HERDR_PROJECTS_REF:-v1.2.27}
+plugin_version() {
+  as_agent "herdr plugin list --json" 2>/dev/null | jq -r '.result.plugins[]? | select(.plugin_id=="herdr-projects") | .version' | head -1
+}
+PLUGIN_VERSION=$(plugin_version)
+if [ -z "$PLUGIN_VERSION" ]; then
+  as_agent "herdr plugin install eliasstravik/herdr-projects --ref '$HERDR_PROJECTS_REF' --yes"
+elif [ "${PLUGIN_VERSION%%.*}" != 1 ]; then
+  echo "   !! herdr-projects $PLUGIN_VERSION is not 1.x; installing $HERDR_PROJECTS_REF"
+  as_agent "herdr plugin install eliasstravik/shepherdr --ref '$HERDR_PROJECTS_REF' --yes"
 fi
-PLUGIN_ROOT=$(as_agent "herdr plugin list --json" | jq -r '.result.plugins[] | select(.plugin_id=="herdr-projects") | .plugin_root')
-if [ -f "$PLUGIN_ROOT/bin/run.sh" ]; then
+PLUGIN_ROOT=""
+for _ in $(seq 30); do
+  PLUGIN_ROOT=$(as_agent "herdr plugin list --json" 2>/dev/null | jq -r '.result.plugins[]? | select(.plugin_id=="herdr-projects") | .plugin_root' | head -1)
+  [ -n "$PLUGIN_ROOT" ] && [ "$PLUGIN_ROOT" != null ] && break
+  sleep 1
+done
+if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/bin/run.sh" ]; then
   as_agent "cd '$PLUGIN_ROOT' && sh bin/run.sh install"   # writes the launcher ~/.herdr-projects/data/bin/herdr-projects
 else
   echo "   !! herdr-projects plugin root not found, open the board once: herdr-projects"
+  MISSING+=("herdr-projects plugin $HERDR_PROJECTS_REF")
 fi
-as_agent "herdr-projects update" >/dev/null 2>&1 || true
+# No `herdr-projects update` here: it can pull 2.0. The plugin ref above is the version autonomous tests.
+as_agent "herdr-projects version" 2>/dev/null | sed 's/^/   /' || true
 # The board key and sidebar rows. The board's first-run screen offers the same blocks; on a server nobody sees it.
 HERDR_CFG="$HOME_DIR/.config/herdr/config.toml"
 if ! grep -q 'herdr-projects.open' "$HERDR_CFG" 2>/dev/null; then

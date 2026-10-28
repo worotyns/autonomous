@@ -10,6 +10,8 @@ the agent works on is autonomous itself: **self-hosting / dogfooding**.
 - Check (must pass before you finish): `make check` — shell/Python syntax, example config, secret scan, CHEATSHEET length.
   It is also the GitHub check (`.github/workflows/check.yml`); keep it offline and non-interactive.
 - Run: not on your machine. The bridge runs on a VPS: `./deploy.sh <host>` (see below).
+- Local e2e: `tests/docker.sh up` (privileged systemd container, no KVM), then `tests/docker.sh scenario work`.
+  This is the fast loop on this host; `tests/docker.sh down` removes it.
 - Before pushing (slower): `make secrets-history`.
 
 ## Map of the repo
@@ -24,15 +26,32 @@ the agent works on is autonomous itself: **self-hosting / dogfooding**.
 | `systemd/` | `herdr.service`, `gh-bridge.service` |
 | `repo-kit/` | files applied to another repo + `apply.sh`; this repo uses filled-in copies at the root |
 | `scripts/vm.sh` | throwaway Ubuntu VM on a Linux host (KVM or TCG) |
-| `tests/` | sandbox test config and the calculator end-to-end scenarios |
+| `tests/` | sandbox test config, Docker container and calculator end-to-end scenarios |
+| `tests/docker.sh` | privileged systemd container: native speed, no KVM |
+| `tests/docker/` | Dockerfile for that systemd container |
 | `.github/` | issue/PR templates, `check.yml`, `release.yml` |
 | `.herdr-projects.json` | this repo's own setup/check for the board (self-hosting) |
 
-## Test VM
+## Test environment
 
-Use a throwaway VM. Docker/Podman containers won't work, because the installer needs systemd and `loginctl`.
+Use a throwaway environment. A plain container won't do, but a **privileged systemd container** does: `loginctl`,
+user managers and systemd units work with systemd as PID 1 and cgroup delegation. That is `tests/docker.sh`, the
+fast local loop (no KVM). A real VM (Lima/QEMU) isolates better and is the release-grade check.
 **Never test by deploying to the live host** (`./deploy.sh` there or `sudo autonomous update`): it restarts herdr
 and gh-bridge and can kill your own session.
+
+### Docker (fast, no KVM)
+
+```bash
+tests/docker.sh up                 # build + start + install (a few minutes)
+tests/docker.sh scenario work      # issue -> PR -> review -> /approve -> merge -> release
+tests/docker.sh logs               # gh-bridge + herdr
+tests/docker.sh down               # remove the container and its token/keys
+```
+
+It uses `--privileged --cgroupns=host` and a writable `/sys/fs/cgroup`; the kernel is the host's, so do not use
+production secrets in it. The test config is sandbox-only and `install.sh` pins herdr-projects `v1.2.27` (Shepherdr
+2.0 renamed the CLI/data dir; override with `HERDR_PROJECTS_REF`). The same repo-kit and `make check` run inside.
 
 ### macOS (Lima)
 
@@ -64,17 +83,17 @@ ssh -F ~/.lima/autonomous/ssh.config lima-autonomous 'sudo autonomous doctor'
 `tests/deploy-vm.sh` deploys the test config with **only the two sandbox repos**, not the live config. Without
 Lima, `scripts/vm.sh up`/`deploy` is a raw-QEMU fallback with the same cloud image and test config.
 
-Docker Sandboxes (`sbx`) is not a replacement: local sandboxes need `/dev/kvm` (`sbx diagnose` says there is no
-hypervisor), and cloud sandboxes are agent containers without systemd/`loginctl`. Use them for an agent, not for
-testing `install.sh`.
+Docker Sandboxes (`sbx`) is not the same thing: local sandboxes need `/dev/kvm` (`sbx diagnose` says there is no
+hypervisor), and cloud sandboxes are agent containers without systemd/`loginctl`. The plain privileged systemd
+container in `tests/docker.sh` is what works here; `sbx` is for an agent, not for testing `install.sh`.
 
 The calculator scenarios are automated in `tests/scenario.sh`; see [tests/README.md](tests/README.md).
 
 ### Both
 
-- Secrets: the human puts them into `/etc/autonomous/env` on the VM. On Linux, `tests/deploy-vm.sh` and
-  `scripts/vm.sh deploy` copy the host's `/etc/autonomous/env` into the VM without printing it; never ask for
-  secrets in chat, never print them.
+- Secrets: the human puts them into `/etc/autonomous/env` on the VM. On Linux, `tests/deploy-vm.sh`,
+  `scripts/vm.sh deploy` and `tests/docker.sh` copy the host's `/etc/autonomous/env` into the sandbox without
+  printing it; never ask for secrets in chat, never print them.
 - Before the first task: run `pi` once as `agent` in a repo (`sudo -iu agent`, `cd ~/repos/<owner>/<repo> && pi`).
 - Quick iteration on `bridge.py` without a full deploy (Lima):
   `rsync -az -e "ssh -F ~/.lima/autonomous/ssh.config" --rsync-path="sudo rsync" bridge.py lima-autonomous:/opt/autonomous/ && ssh -F ~/.lima/autonomous/ssh.config lima-autonomous 'sudo systemctl restart gh-bridge'`
@@ -83,6 +102,7 @@ The calculator scenarios are automated in `tests/scenario.sh`; see [tests/README
 ### Delete
 
 ```bash
+tests/docker.sh down              # Docker: removes the container, its token/keys and /var/lib/autonomous
 limactl delete -f autonomous      # Lima: removes the VM, its disk (~3 GB) and the ssh config, including the GH token
 rm -rf ~/.autonomous-vm           # raw QEMU: after `scripts/vm.sh down`
 ```
@@ -99,7 +119,7 @@ Use private sandbox repos, never real ones: a tiny project with a `Makefile` (`s
 | issue + `consult`, then "write it up", then `start` | answers on the issue, body rewritten, consult ends, work task starts |
 | `/approve` in the issue, or a manual merge | merged, issue closed, `agent:done`, release tag |
 | two repos at once | both tasks run in parallel |
-| `sudo reboot` | `herdr`, `gh-bridge` and the herdr-projects keeper come back, board state kept |
+| reboot the VM / `docker restart` | `herdr`, `gh-bridge` and the herdr-projects keeper come back, board state kept |
 
 Watch with `herdr-projects list --json` (as `agent`) and `sudo journalctl -u gh-bridge -f`.
 `tests/scenario.sh` automates the calculator cases against the private sandbox repos; see [tests/README.md](tests/README.md).
@@ -108,8 +128,9 @@ Watch with `herdr-projects list --json` (as `agent`) and `sudo journalctl -u gh-
 
 1. Every acceptance criterion of the issue has a test, or a stated manual proof in the PR description.
 2. `make check` passes locally (and in CI).
-3. Installer/systemd/bridge/config changes are exercised on a throwaway VM (Lima or `scripts/vm.sh`) when you can;
-   otherwise the PR says they were not and gives the exact commands for the human. Never test them on the live host.
+3. Installer/systemd/bridge/config changes are exercised in the Docker sandbox (`tests/docker.sh`) or a throwaway
+   VM (Lima/`scripts/vm.sh`) when you can; otherwise the PR says they were not and gives the exact commands for the
+   human. Never test them on the live host.
 4. The PR description lists the acceptance criteria, ticked, each with how it was verified.
 5. The diff stays inside the issue's scope. Anything else you noticed goes under "Also noticed" in the PR, not in code.
 6. No secrets, no generated files, no unrelated formatting changes.

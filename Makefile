@@ -4,7 +4,7 @@ PY ?= python3
 SECRET_RE := ghp_|github_pat_|sk-or-[a-z0-9]|BEGIN .*PRIVATE KEY|@[a-z0-9-]+\.(com|io|pl)
 PLACEHOLDERS := you@example\.com|noreply
 
-.PHONY: setup check syntax config secrets secrets-history docs run vm-up vm-down vm-reset vm-deploy vm-status vm-logs
+.PHONY: setup check syntax config secrets secrets-history docs run vm-up vm-down vm-reset vm-deploy vm-status vm-logs docker-test docker-down
 
 setup: ## nothing to install; just make sure the tools exist
 	@$(PY) -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else "Python 3.11+ required")'
@@ -15,7 +15,7 @@ check: syntax config secrets docs ## what the board and CI run before a PR
 	@echo "make check: ok"
 
 syntax:
-	bash -n install.sh deploy.sh repo-kit/apply.sh scripts/vm.sh tests/scenario.sh tests/deploy-vm.sh
+	bash -n install.sh deploy.sh repo-kit/apply.sh scripts/vm.sh tests/scenario.sh tests/deploy-vm.sh tests/docker.sh
 	$(PY) -c "import ast; ast.parse(open('bridge.py').read())"
 
 config:
@@ -48,3 +48,7 @@ vm-reset: ; scripts/vm.sh reset
 vm-deploy: ; scripts/vm.sh deploy
 vm-status: ; scripts/vm.sh status
 vm-logs: ; scripts/vm.sh logs
+
+# Fast local e2e in a privileged systemd container (no KVM); see tests/README.md.
+docker-test: ; tests/docker.sh up
+docker-down: ; tests/docker.sh down
