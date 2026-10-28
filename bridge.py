@@ -63,6 +63,8 @@ def load_config() -> dict:
     cfg = tomllib.loads(CONFIG_PATH.read_text())
     b = cfg.setdefault("bridge", {})
     b.setdefault("poll_interval", 60)
+    b.setdefault("poll_interval_max", 300)
+    b.setdefault("poll_backoff_factor", 1.5)
     b.setdefault("quiet_window", 90)
     b.setdefault("repos_dir", str(Path.home() / "repos"))
     b.setdefault("herdr_projects", str(Path.home() / ".herdr-projects/data/bin/herdr-projects"))
@@ -173,7 +175,7 @@ def apply_state(c, task_id: str, label: str | None, note: str = "", state: str |
         row = c.execute("select * from tasks where task_id=?", (task_id,)).fetchone()
         if not row or (row["label"] == label and (state is None or row["state"] == state)):
             c.execute("commit")
-            return
+            return False
         c.execute("update tasks set label=?, state=coalesce(?, state), updated_at=? where task_id=?",
                   (label, state, now_iso(), task_id))
         c.execute("commit")
@@ -181,11 +183,12 @@ def apply_state(c, task_id: str, label: str | None, note: str = "", state: str |
         c.execute("rollback")
         raise
     if row["label"] == label:
-        return
+        return False
     set_label(row["repo"], row["issue"], label)
     if note:
         comment(row["repo"], row["issue"], note)
     log(f"{row['repo']}#{row['issue']} ({task_id}) -> {label}")
+    return True
 
 
 def notes_for(label: str, task: dict, repo: str, task_id: str) -> str:
@@ -246,6 +249,7 @@ def end_consult(cfg: dict, c, row):
 def pick_up_issues(cfg: dict, c):
     start, consult = cfg["github"]["start_label"], cfg["consult"]["label"]
     ok = allowed(cfg)
+    started = False
     for r in cfg["repo"]:
         repo = r["name"]
         for label, kind in ((consult, "consult"), (start, "work")):
@@ -267,11 +271,14 @@ def pick_up_issues(cfg: dict, c):
                     run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", consult], check=False)
                     i = gh_api(f"repos/{repo}/issues/{n}")  # the body the consult may have rewritten
                 start_task(cfg, c, r, i, kind)
+                started = True
+    return started
 
 
 def deliver_comments(cfg: dict, c):
     ok = allowed(cfg)
     quiet = cfg["bridge"]["quiet_window"]
+    delivered = False
     for row in c.execute("select * from tasks where state not in ('done','closed')").fetchall():
         repo, n, tid, cursor = row["repo"], row["issue"], row["task_id"], row["cursor"]
         new = [x for x in gh_api(f"repos/{repo}/issues/{n}/comments?since={cursor}&per_page=100")
@@ -284,18 +291,22 @@ def deliver_comments(cfg: dict, c):
             if body.startswith(("/approve", "/stop")):
                 cmd = "approve" if body.startswith("/approve") else "stop"
                 comment(repo, n, f"🤖 `{tid}`: {said(hp(cfg, cmd, tid, check=False), cmd)}")
+                delivered = True
             else:
                 texts.append(f"@{x['user']['login']}: {body}")
         if texts:
             prompt = "consult_comment.md" if row["kind"] == "consult" else "issue_comment.md"
             hp(cfg, "tell", tid, render(prompt, repo=repo, number=n, comments="\n\n".join(texts)))
             log(f"{repo}#{n}: told {tid} {len(texts)} comment(s)")
+            delivered = True
         c.execute("update tasks set cursor=? where task_id=?", (new[-1]["created_at"], tid))
+    return delivered
 
 
 def sync_states(cfg: dict, c):
     tasks = hp(cfg, "list", "--all")
     by_id = {t["id"]: t for t in tasks if isinstance(t, dict) and "id" in t} if isinstance(tasks, list) else {}
+    changed = False
     for row in c.execute("select * from tasks where state not in ('done','closed')").fetchall():
         t = by_id.get(row["task_id"])
         if t is None:
@@ -309,34 +320,44 @@ def sync_states(cfg: dict, c):
         c.execute("update tasks set board_state=? where task_id=?", (seen, row["task_id"]))
         if row["kind"] == "consult":  # every turn end is `blocked` there: that is the conversation, not a question
             if state == "done":
-                apply_state(c, row["task_id"], None, state="closed")
+                changed = apply_state(c, row["task_id"], None, state="closed") or changed
             else:
-                apply_state(c, row["task_id"], "agent:failed" if state == "error" else "agent:consulting",
-                            notes_for("agent:failed", t, row["repo"], row["task_id"]) if state == "error" else "")
+                changed = apply_state(c, row["task_id"], "agent:failed" if state == "error" else "agent:consulting",
+                                      notes_for("agent:failed", t, row["repo"], row["task_id"]) if state == "error" else "") or changed
             continue
         label = "agent:ready" if (state, stage) == ("blocked", "approval") else STATE_TO_LABEL.get(state)
         if label is None:
             continue
-        apply_state(c, row["task_id"], label, notes_for(label, t, row["repo"], row["task_id"]) if label != "agent:working" else "",
-                    state="done" if state == "done" else state)
+        changed = apply_state(c, row["task_id"], label, notes_for(label, t, row["repo"], row["task_id"]) if label != "agent:working" else "",
+                              state="done" if state == "done" else state) or changed
+    return changed
 
 
 # ---------------------------------------------------------------- commands
 
-def cmd_once(cfg):
+def cmd_once(cfg) -> bool:
     c = db()
+    did_work = False
     for job in (pick_up_issues, deliver_comments, sync_states):
         try:
-            job(cfg, c)
+            did_work = job(cfg, c) or did_work
         except Exception as e:  # one failing job (rate limit, a repo gone) must not stop the others
             log(f"{job.__name__}: {e}")
+    return did_work
 
 
 def cmd_run(cfg):
-    log(f"gh-bridge: {len(cfg['repo'])} repos, every {cfg['bridge']['poll_interval']}s, as {gh_user()}")
+    base = cfg["bridge"]["poll_interval"]
+    longest = cfg["bridge"]["poll_interval_max"]
+    factor = cfg["bridge"]["poll_backoff_factor"]
+    log(f"gh-bridge: {len(cfg['repo'])} repos, every {base}-{longest}s, as {gh_user()}")
+    current = base
     while True:
-        cmd_once(cfg)
-        time.sleep(cfg["bridge"]["poll_interval"])
+        if cmd_once(cfg):
+            current = base  # activity: back to the fast interval
+        else:
+            current = min(current * factor, longest)  # quiet: wait longer, up to the cap
+        time.sleep(current)
 
 
 def cmd_notify(cfg):

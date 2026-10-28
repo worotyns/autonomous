@@ -4,14 +4,14 @@ PY ?= python3
 SECRET_RE := ghp_|github_pat_|sk-or-[a-z0-9]|BEGIN .*PRIVATE KEY|@[a-z0-9-]+\.(com|io|pl)
 PLACEHOLDERS := you@example\.com|noreply
 
-.PHONY: setup check syntax config secrets secrets-history docs run vm-up vm-down vm-reset vm-deploy vm-status vm-logs docker-test docker-down
+.PHONY: setup check syntax config test secrets secrets-history docs run vm-up vm-down vm-reset vm-deploy vm-status vm-logs docker-test docker-down
 
 setup: ## nothing to install; just make sure the tools exist
 	@$(PY) -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else "Python 3.11+ required")'
 	@command -v bash >/dev/null || { echo "bash is required" >&2; exit 1; }
 	@echo "ok: $$($(PY) --version 2>&1), bash; nothing to install"
 
-check: syntax config secrets docs ## what the board and CI run before a PR
+check: syntax config test secrets docs ## what the board and CI run before a PR
 	@echo "make check: ok"
 
 syntax:
@@ -21,6 +21,9 @@ syntax:
 config:
 	$(PY) -c "import tomllib; [tomllib.load(open(p, 'rb')) for p in ('config/autonomous.example.toml', 'tests/autonomous.test.toml.in')]"
 	$(PY) -c "import json; [json.load(open(p)) for p in ('.herdr-projects.json', 'repo-kit/.herdr-projects.json')]"
+
+test: ## unit tests for bridge.py, gh and herdr-projects mocked
+	$(PY) tests/test_bridge.py
 
 secrets: ## working tree + new files; ignored files such as config/env are not searched
 	@hits=$$(git grep --untracked -n -I -i -E '$(SECRET_RE)' -- . ':!Makefile' | grep -v -E '$(PLACEHOLDERS)' || true); \
