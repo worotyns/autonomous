@@ -93,7 +93,7 @@ up() {
 
 Next:
   tests/docker.sh scenario work     # full start -> PR -> review -> /approve -> merge -> release
-  tests/docker.sh shell             # ubuntu shell in the container
+  tests/docker.sh shell             # shell in the container
   tests/docker.sh logs              # gh-bridge + herdr logs
   tests/docker.sh down              # remove the container
 EOF
