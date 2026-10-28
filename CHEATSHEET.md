@@ -1,71 +1,71 @@
-# autonomous: ściąga
+# autonomous: cheatsheet
 
-**Co to robi:** piszesz issue na GitHubie, dajesz label, a agent na serwerze robi resztę: kod, testy, PR i review. Ty tylko odpowiadasz na pytania i akceptujesz.
+**What it does:** you write an issue on GitHub and add a label; an agent on the server does the rest: code, tests, PR and review. You only answer questions and approve.
 
-**Słowniczek:** *issue* to zadanie na GitHubie, *label* to etykieta, która steruje agentem (`start`, `consult`), *PR* to propozycja zmian w kodzie od agenta, a *agent* (pi) to program, który pisze kod na serwerze.
+**Glossary:** *issue* = a task on GitHub, *label* = a tag that steers the agent (`start`, `consult`), *PR* = the agent's proposed code change, *agent* (pi) = the program writing code on the server.
 
-## Zlecenie zadania (codziennie)
+## Handing over a task (every day)
 
-1. **New issue** → szablon **Agent task**.
-2. Wypełnij **Acceptance criteria**: każdy punkt to jedna rzecz do sprawdzenia.
-   - ✅ `div(a, 0) rzuca ZeroDivisionError`
-   - ❌ `ma działać dobrze`
-3. Dodaj label **`start`**. Za ~1 min pojawi się `agent:working`.
-4. Czekaj na `agent:ready` i link do PR → przejrzyj PR.
-5. Wpisz w issue **`/approve`**. Merge, tag i release robią się same.
+1. **New issue** → template **Agent task**.
+2. Fill in the **Acceptance criteria**: each line is one thing that can be checked.
+   - ✅ `div(a, 0) raises ZeroDivisionError`
+   - ❌ `it should work well`
+3. Add the label **`start`**. Within ~1 min you'll see `agent:working`.
+4. Wait for `agent:ready` and a link to the PR → review the PR.
+5. Write **`/approve`** on the issue. Merge, tag and release happen by themselves.
 
-**Nie wiesz jeszcze, co dokładnie chcesz?** Daj label **`consult`** zamiast `start`. Agent przeczyta kod i zaproponuje opcje w komentarzach. Gdy już wiesz, napisz „spisz to”, a potem dodaj **`start`**.
+**Not sure yet?** Use **`consult`** instead of `start`: the agent reads the code and suggests options in comments. Then write “write it up” and add **`start`**.
 
-## Komentarze
+## Comments
 
-| Gdzie | Co się dzieje |
+| Where | What happens |
 |---|---|
-| w **issue** | agent dostaje Twój komentarz po ~90 s ciszy (zdąż dopisać) |
-| w **PR** | agent poprawia kod i pushuje |
-| `/approve` w issue | merge (tylko gdy jest `agent:ready`) |
-| `/stop` w issue | zatrzymuje agenta |
+| on the **issue** | the agent gets your comment after ~90 s of quiet |
+| on the **PR** | the agent fixes the code and pushes |
+| `/approve` on the issue | merge (only when it's `agent:ready`) |
+| `/stop` on the issue | stops the agent |
 
-Agent słucha tylko Ciebie (konto z `GH_TOKEN`) i osób z `allow_authors`.
+The agent listens only to you (the `GH_TOKEN` account) and to people in `allow_authors`.
 
-## Labele: co znaczą
+## Labels: what they mean
 
-| Label | Znaczy | Ty |
+| Label | Means | You |
 |---|---|---|
-| `agent:consulting` | rozmowa, bez kodu | odpisuj w komentarzach |
-| `agent:working` | agent pracuje | nic, czekaj |
-| `agent:needs-input` | agent pyta | odpowiedz w komentarzu |
-| `agent:ready` | PR gotowy, po review | przejrzyj → `/approve` |
-| `agent:failed` | coś padło | komentarz z podpowiedzią albo `/stop` |
-| `agent:done` | zmergowane | 🎉 |
+| `agent:consulting` | a discussion, no code | reply in comments |
+| `agent:working` | the agent is working | nothing, wait |
+| `agent:needs-input` | the agent asks something | answer in a comment |
+| `agent:ready` | PR ready, reviewed | review it → `/approve` |
+| `agent:failed` | something broke | a comment with a hint, or `/stop` |
+| `agent:done` | merged | 🎉 |
 
-Wersja releasu: label na **PR** `release:minor` / `release:major` / `release:none`. Bez labela robi się patch.
+Release: label the **PR** `release:minor` / `release:major` / `release:none`; no label = patch.
 
-## Pierwszy setup (raz)
+## First setup (once)
 
 ```bash
 git clone https://github.com/worotyns/autonomous && cd autonomous
-cp config/autonomous.example.toml config/autonomous.toml   # wpisz swoje repo
+cp config/autonomous.example.toml config/autonomous.toml   # put your repos in
 cp config/env.example config/env                           # OPENROUTER_API_KEY, GH_TOKEN
-./deploy.sh root@<ip-serwera>
-ssh root@<ip-serwera>  →  sudo -iu agent  →  cd ~/repos/<owner>/<repo> && pi   # raz, potem ctrl+c
-repo-kit/apply.sh <owner>/<repo>     # PR z szablonami do Twojego repo, zmerguj go
+./deploy.sh root@<server-ip>
+# once on the server: sudo -iu agent; cd ~/repos/<owner>/<repo>; pi; ctrl+c
+repo-kit/apply.sh <owner>/<repo>     # PR with templates; merge it
 ```
 
-## Na serwerze (`ssh root@<ip-serwera>`)
+## On the server (`ssh root@<server-ip>`)
 
-| Chcę | Wpisz |
+| I want to | Type |
 |---|---|
-| sprawdzić, czy wszystko działa | `sudo autonomous doctor` |
-| zobaczyć zadania | `sudo autonomous status` |
-| podejrzeć agenta na żywo | `sudo autonomous attach` (`ctrl+b a` = board, `ctrl+b q` = wyjdź, agent pracuje dalej) |
-| logi (np. `start` nic nie robi) | `sudo autonomous logs` |
-| po zmianie configu / nowe repo | `sudo autonomous update` |
-| coś się zawiesiło | `sudo autonomous restart` |
+| check that everything works | `sudo autonomous doctor` |
+| see the tasks | `sudo autonomous status` |
+| watch an agent live | `sudo autonomous attach` (`ctrl+b a` board, `ctrl+b q` leave) |
+| logs (e.g. `start` does nothing) | `sudo autonomous logs` |
+| after a config change / a new repo | `sudo autonomous update` |
+| something hangs | `sudo autonomous restart` |
 
-Nowe repo: dopisz `[[repo]]` w `/etc/autonomous/autonomous.toml` i potem `update`. W oknie agenta nic nie pisz, chyba że chcesz go przejąć.
+New repo: add `[[repo]]` to `/etc/autonomous/autonomous.toml`, then `update`. Don't type in the agent's window unless you mean to take over.
 
-## 3 zasady
+## 3 rules
 
-1. **Konkretne acceptance criteria** dają dobry wynik. Ogólniki dają zgadywanie.
-2. **Na serwerze nie ma sekretów produkcyjnych**, bo agent ma pełny shell.
-3. **Nic nie merguje się bez `/approve`.** Zawsze przejrzyj PR.
+1. **Concrete acceptance criteria** give good results. Vague ones make the agent guess.
+2. **No production secrets on the server**: the agent has a full shell.
+3. **Nothing merges without `/approve`.** Always review the PR.

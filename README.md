@@ -1,39 +1,39 @@
 # autonomous
 
-**Issue na GitHubie → agent na Twoim VPS pisze kod, testuje, otwiera PR, przechodzi review drugiego agenta i czeka na Twoje `/approve` → merge → tag i release.** Dla wielu repo naraz, z jednego serwera. Do tego tryb **konsultacji**: najpierw rozmawiasz z agentem o produkcie i kodzie, potem jednym labelem puszczasz to do realizacji.
+**A GitHub issue → an agent on your VPS writes the code, tests it, opens a PR, gets reviewed by a second agent and waits for your `/approve` → merge → tag and release.** Many repos at once, from one server. Plus a **consult** mode: first you talk the product and the code through with an agent, then one label sends it to be built.
 
 ```mermaid
 flowchart LR
-    I([Issue]) -->|label consult| C[Konsultacja<br/>agent czyta kod,<br/>odpowiada w issue]
-    C -->|rozmowa w komentarzach| C
-    C -->|"„spisz to”"| S[Issue przepisane:<br/>decyzje + acceptance criteria]
+    I([Issue]) -->|label consult| C[Consultation<br/>agent reads the code,<br/>answers on the issue]
+    C -->|discussion in comments| C
+    C -->|"“write it up”"| S[Issue rewritten:<br/>decisions + acceptance criteria]
     S -->|label start| W
-    I -->|label start| W[Agent koduje<br/>w osobnym worktree]
+    I -->|label start| W[Agent codes<br/>in its own worktree]
     W --> K[check + draft PR]
-    K --> R{Review<br/>drugiego agenta}
-    R -->|uwagi| W
-    R -->|ok| A[[agent:ready<br/>czeka na Ciebie]]
-    A -->|komentarz w PR| W
-    A -->|/approve w issue| M[merge]
-    M --> T[release.yml:<br/>tag vX.Y.Z → release → obraz GHCR]
+    K --> R{Review by<br/>a second agent}
+    R -->|findings| W
+    R -->|ok| A[[agent:ready<br/>waits for you]]
+    A -->|comment on the PR| W
+    A -->|/approve on the issue| M[merge]
+    M --> T[release.yml:<br/>tag vX.Y.Z → release → GHCR image]
 ```
 
-Początkujesz? Zacznij od **[CHEATSHEET.md](CHEATSHEET.md)** (jedna kartka A4).
+New to this? Start with **[CHEATSHEET.md](CHEATSHEET.md)** (one A4 page).
 
-Przetestowane end-to-end na Ubuntu 24.04 (Lima VM, arm64), na dwóch repo:
-- zadania równolegle,
-- agent pyta → Ty odpowiadasz w issue,
-- poprawki z komentarza w PR,
-- konsultacja → `start`,
-- `/approve` i ręczny merge,
-- restart maszyny.
+Tested end-to-end on Ubuntu 24.04 (Lima VM, arm64), on two repos:
+- tasks in parallel,
+- the agent asks → you answer on the issue,
+- fixes from a PR comment,
+- consult → `start`,
+- `/approve` and a manual merge,
+- a machine reboot.
 
-## Z czego to jest zrobione
+## What it's built from
 
 ```mermaid
 flowchart TB
-    subgraph GH[GitHub, wiele repo]
-        issues[Issues + labele]
+    subgraph GH[GitHub, many repos]
+        issues[Issues + labels]
         prs[Pull requests]
         act[Actions: release.yml]
     end
@@ -47,129 +47,129 @@ flowchart TB
         end
     end
     OR[(OpenRouter)]
-    issues <-->|poll co 60 s, labele, komentarze| bridge
+    issues <-->|poll every 60 s, labels, comments| bridge
     bridge -->|add / tell / approve| board
     board -->|board.notify| bridge
     board --> a1 & a2 & rv
     a1 & a2 & rv --> OR
-    board <-->|draft PR, feedback, checki, merge| prs
-    prs -->|merge do main| act
+    board <-->|draft PR, feedback, checks, merge| prs
+    prs -->|merge to main| act
 ```
 
-| Element | Rola |
+| Part | Role |
 |---|---|
-| [herdr](https://herdr.dev) | serwer terminali dla agentów: sesje żyją w tle, można się podpiąć przez SSH i podejrzeć agenta |
-| [herdr-projects](https://github.com/eliasstravik/herdr-projects) | plugin herdr: board, multi-repo, worktree na zadanie, check, draft PR, review drugim agentem, merge tylko po akceptacji, reakcja na komentarze w PR, tryb `--chat` (konsultacje) |
-| [pi](https://github.com/earendil-works/pi) | agent kodujący |
-| [OpenRouter](https://openrouter.ai) | modele, domyślnie `deepseek/deepseek-v4.1-flash` (tani; zmiana jedną linią) |
+| [herdr](https://herdr.dev) | terminal server for agents: sessions live in the background, you can attach over SSH and watch an agent |
+| [herdr-projects](https://github.com/eliasstravik/herdr-projects) | herdr plugin: board, multi-repo, a worktree per task, check, draft PR, review by a second agent, merge only after approval, reacts to PR comments, `--chat` mode (consults) |
+| [pi](https://github.com/earendil-works/pi) | the coding agent |
+| [OpenRouter](https://openrouter.ai) | models, `deepseek/deepseek-v4.1-flash` by default (cheap; one line to change) |
 | `gh` | GitHub CLI |
-| **gh-bridge** (`bridge.py`) | spina issues z boardem: labele `consult`/`start` → zadania, komentarze w issue → agent, stan → labele `agent:*`, `/approve`, `/stop` |
-| **repo-kit** | do każdego repo: szablon issue z acceptance criteria, `AGENTS.md` (Definition of Done), `release.yml` |
+| **gh-bridge** (`bridge.py`) | joins issues to the board: `consult`/`start` labels → tasks, issue comments → agent, state → `agent:*` labels, `/approve`, `/stop` |
+| **repo-kit** | for each repo: issue template with acceptance criteria, `AGENTS.md` (Definition of Done), `release.yml` |
 
-## TL;DR: setup VPS
+## TL;DR: VPS setup
 
-Potrzebujesz VPS z Ubuntu 22.04+ / Debian 12+ (x86_64 lub arm64), 2+ GB RAM, dostępu `root` albo usera z sudo.
+You need a VPS with Ubuntu 22.04+ / Debian 12+ (x86_64 or arm64), 2+ GB RAM, and `root` or a user with sudo.
 
 ```bash
 git clone https://github.com/worotyns/autonomous && cd autonomous
-cp config/autonomous.example.toml config/autonomous.toml   # [[repo]] z Twoimi repo, [git] name/email
+cp config/autonomous.example.toml config/autonomous.toml   # [[repo]] with your repos, [git] name/email
 cp config/env.example config/env                           # OPENROUTER_API_KEY, GH_TOKEN
-./deploy.sh root@<ip-vps>                                  # albo ubuntu@<ip>; opcjonalnie --tailscale
+./deploy.sh root@<vps-ip>                                  # or ubuntu@<ip>; optionally --tailscale
 ```
 
-Raz na VPS (herdr-projects wymaga jednego ręcznego startu agenta):
+Once on the VPS (herdr-projects needs each agent started by hand once):
 
 ```bash
 sudo -iu agent
-cd ~/repos/<owner>/<repo> && pi     # odpowiada? wyjdź (ctrl+c)
+cd ~/repos/<owner>/<repo> && pi     # does it answer? quit (ctrl+c)
 ```
 
-Do każdego repo repo-kit (otwiera PR, nic nie nadpisuje):
+Add the repo-kit to each repo (opens a PR, overwrites nothing):
 
 ```bash
 repo-kit/apply.sh owner/repo1 owner/repo2
 ```
 
-W tym PR uzupełnij w `AGENTS.md` komendy (install, check) i mapę repo, a w `.herdr-projects.json` komendę checku. Tani model działa dużo lepiej, gdy nie musi zgadywać.
+In that PR, fill in the commands (install, check) and a repo map in `AGENTS.md`, and the check command in `.herdr-projects.json`. A cheap model does much better when it doesn't have to guess.
 
-**Tokeny:**
-- `GH_TOKEN` to token konta, którego komentarze sterują agentem (zwykle Twój). Najlepiej fine-grained, tylko na wybrane repo: Contents, Issues, Pull requests (RW), Actions, Commit statuses, Metadata (R).
-- `OPENROUTER_API_KEY`: osobny klucz z limitem kredytów.
+**Tokens:**
+- `GH_TOKEN`: the token of the account whose comments steer the agent (usually yours). Best fine-grained, only for the chosen repos: Contents, Issues, Pull requests (RW), Actions, Commit statuses, Metadata (R).
+- `OPENROUTER_API_KEY`: a separate key with a credit limit.
 
-## Jak z tym pracować
+## Day to day
 
 ```mermaid
 sequenceDiagram
-    actor Ty
+    actor You
     participant GH as GitHub issue / PR
     participant B as gh-bridge
     participant A as agent (pi)
-    Ty->>GH: issue + label start
-    B->>A: zadanie (treść issue + AC)
-    A-->>GH: pytanie (agent:needs-input)
-    Ty->>GH: odpowiedź w komentarzu
-    B->>A: przekazuje po ~90 s ciszy
+    You->>GH: issue + label start
+    B->>A: task (issue body + AC)
+    A-->>GH: question (agent:needs-input)
+    You->>GH: answer in a comment
+    B->>A: passes it on after ~90 s of quiet
     A->>GH: draft PR → review → agent:ready
-    Ty->>GH: komentarz w PR
-    GH->>A: herdr-projects budzi agenta, poprawka, push
-    Ty->>GH: /approve
+    You->>GH: comment on the PR
+    GH->>A: herdr-projects wakes the agent, fix, push
+    You->>GH: /approve
     B->>A: approve → merge → agent:done
     GH->>GH: release.yml: tag + release
 ```
 
-| Chcę | Robię |
+| I want to | I do |
 |---|---|
-| przegadać pomysł przed realizacją | issue + label `consult` → rozmowa w komentarzach → „spisz to” → label `start` |
-| zlecić zadanie | issue z szablonu **Agent task** (konkretne acceptance criteria!) + label `start` |
-| odpowiedzieć agentowi / doprecyzować | komentarz w issue |
-| poprawki w kodzie | komentarze / review na PR |
-| zmergować | `/approve` w issue (albo merge ręcznie, też zadziała) |
-| zatrzymać | `/stop` w issue |
-| typ wersji | label na PR: `release:minor`, `release:major`, `release:none` (domyślnie patch) |
-| podejrzeć agenta na żywo | `sudo autonomous attach`; board: `ctrl+b a`, wyjście: `ctrl+b q` |
-| status / logi / zdrowie | `sudo autonomous status`, `sudo autonomous logs`, `sudo autonomous doctor` |
-| dodać repo | `[[repo]]` w `/etc/autonomous/autonomous.toml` → `sudo autonomous update` |
-| aktualizacja | `./deploy.sh <host>` jeszcze raz (idempotentny, nie rusza configu w `/etc/autonomous`) |
+| talk an idea through before building it | issue + label `consult` → discuss in comments → “write it up” → label `start` |
+| hand over a task | issue from the **Agent task** template (concrete acceptance criteria!) + label `start` |
+| answer the agent / clarify | comment on the issue |
+| get code changes | comments / review on the PR |
+| merge | `/approve` on the issue (or merge by hand, that works too) |
+| stop it | `/stop` on the issue |
+| pick the version bump | label on the PR: `release:minor`, `release:major`, `release:none` (patch by default) |
+| watch an agent live | `sudo autonomous attach`; board: `ctrl+b a`, leave: `ctrl+b q` |
+| status / logs / health | `sudo autonomous status`, `sudo autonomous logs`, `sudo autonomous doctor` |
+| add a repo | `[[repo]]` in `/etc/autonomous/autonomous.toml` → `sudo autonomous update` |
+| update | `./deploy.sh <host>` again (idempotent, leaves the config in `/etc/autonomous` alone) |
 
-Labele: `agent:consulting` · `agent:working` → (`agent:needs-input`) → `agent:ready` → `agent:done`, albo `agent:failed`.
+Labels: `agent:consulting` · `agent:working` → (`agent:needs-input`) → `agent:ready` → `agent:done`, or `agent:failed`.
 
-**Model konsultanta:** `[consult] agent` w configu albo `AUTONOMOUS_CONSULT_AGENT` w `/etc/autonomous/env`, np. `pi/openrouter/deepseek/deepseek-v4-pro`. Warto mocniejszy niż model do kodu, bo tekstu jest mało, a myślenia dużo. Pozostałe modele (agent, reviewer) są w sekcji `[herdr_projects]`. Listę nazw daje `pi --list-models`.
+**Consult model:** `[consult] agent` in the config or `AUTONOMOUS_CONSULT_AGENT` in `/etc/autonomous/env`, e.g. `pi/openrouter/deepseek/deepseek-v4-pro`. A stronger model than the coding one pays off here: little text, a lot of thinking. The other models (agent, reviewer) are in the `[herdr_projects]` section. `pi --list-models` lists the names.
 
-## Test lokalnie (macOS, Lima)
+## Test locally (macOS, Lima)
 
 ```bash
 brew install lima
 limactl start --name=autonomous --tty=false --cpus=4 --memory=4 --disk=20 --mount-none template:ubuntu-24.04
 limactl show-ssh --format=config autonomous | sed 's/^Host .*/Host lima-autonomous/' > ~/.lima/autonomous/ssh.config.host
 SSH_CONFIG=~/.lima/autonomous/ssh.config.host ./deploy.sh lima-autonomous
-# sprzątanie: limactl delete -f autonomous
+# clean up: limactl delete -f autonomous
 ```
 
-Zwykły kontener (Docker/Podman) się nie nada, bo instalator potrzebuje systemd. Scenariusze testowe i checklista przed pushem są w [AGENTS.md](AGENTS.md).
+A plain container (Docker/Podman) won't do, because the installer needs systemd. Test scenarios and the pre-push checklist are in [AGENTS.md](AGENTS.md).
 
-## Co gdzie leży
+## What's where
 
 | | |
 |---|---|
-| `deploy.sh` | z laptopa: rsync do `/opt/autonomous` + `install.sh` na serwerze |
-| `install.sh` | instalator: pakiety, user `agent`, herdr + plugin, pi, repo, labele, ustawienia boardu, usługi systemd |
-| `bridge.py` | gh-bridge (Python, sama biblioteka standardowa); na serwerze przez `sudo autonomous doctor\|status\|logs\|attach\|restart\|update` |
-| `prompts/` | brief zadania i konsultacji, wiadomości z komentarzami z issue |
-| `config/` | przykładowy config i env; prawdziwe lądują w `/etc/autonomous/` |
-| `systemd/` | `herdr.service` (`herdr server`) i `gh-bridge.service` |
-| `repo-kit/` | pliki do repo + `apply.sh` |
+| `deploy.sh` | from your laptop: rsync to `/opt/autonomous` + `install.sh` on the server |
+| `install.sh` | installer: packages, user `agent`, herdr + plugin, pi, repos, labels, board settings, systemd services |
+| `bridge.py` | gh-bridge (Python, standard library only); on the server via `sudo autonomous doctor\|status\|logs\|attach\|restart\|update` |
+| `prompts/` | task and consult briefs, messages carrying issue comments |
+| `config/` | example config and env; the real ones go to `/etc/autonomous/` |
+| `systemd/` | `herdr.service` (`herdr server`) and `gh-bridge.service` |
+| `repo-kit/` | files for each repo + `apply.sh` |
 
-Na VPS: config w `/etc/autonomous/`, stan mostu w `/var/lib/autonomous/`, repo w `/home/agent/repos/<owner>/<repo>`, worktree w `/home/agent/.herdr/worktrees/`.
+On the VPS: config in `/etc/autonomous/`, bridge state in `/var/lib/autonomous/`, repos in `/home/agent/repos/<owner>/<repo>`, worktrees in `/home/agent/.herdr/worktrees/`.
 
-## Bezpieczeństwo, przeczytaj przed podpięciem prawdziwych repo
+## Security: read before connecting real repos
 
-- **Agent ma pełny shell usera `agent`** (pi nie pyta o zgodę). Nie trzymaj na tym VPS sekretów produkcyjnych i nie dawaj `agent` sudo.
-- **Sterują tylko zaufani:** komentarze w PR budzą agenta tylko od właściciela `GH_TOKEN`, a w issue tylko od niego i od `allow_authors`. Labele `start`/`consult` od innych są zdejmowane. Komentarze obcych są ignorowane (prompt injection).
-- **Nic nie merguje się bez Ciebie** (`merge.by = you`, `merge.checks = github`). Włącz też branch protection z wymaganym CI.
-- Limit kredytów na kluczu OpenRouter, `limit.time` na zadanie.
+- **The agent has a full shell as user `agent`** (pi doesn't ask for permission). Keep no production secrets on this VPS and don't give `agent` sudo.
+- **Only trusted people steer it:** PR comments wake the agent only from the `GH_TOKEN` owner; issue comments only from them and from `allow_authors`. `start`/`consult` labels added by anyone else are removed. Comments from others are ignored (prompt injection).
+- **Nothing merges without you** (`merge.by = you`, `merge.checks = github`). Also turn on branch protection with required CI.
+- Put a credit limit on the OpenRouter key, and `limit.time` per task.
 
-## Znane ograniczenia
+## Known limitations
 
-- Labele po merge'u odświeżają się z pollingiem (do ~60 s).
-- `release.yml` taguje każdy push do `main`, także commity spoza agentów (`release:none` na PR wyłącza).
-- Sprawdzone na Ubuntu 24.04 arm64 (Lima). Na x86 powinno działać tak samo (instalatory herdr i herdr-projects wspierają oba), ale tego nie testowałem.
+- Labels catch up with a merge on the next poll (up to ~60 s).
+- `release.yml` tags every push to `main`, including commits not made by agents (`release:none` on the PR turns it off).
+- Checked on Ubuntu 24.04 arm64 (Lima). x86 should work the same (the herdr and herdr-projects installers support both), but I haven't tested it.
