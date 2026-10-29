@@ -183,7 +183,7 @@ cat > /usr/local/bin/autonomous <<'EOF'
 #!/bin/sh
 # Short commands for the box. Run with sudo: sudo autonomous <doctor|status|logs|attach|restart|update>
 case "${1:-help}" in
-  logs)    exec journalctl -u gh-bridge -u herdr -f ;;
+  logs)    exec sh -c 'tail -n 20 -F /var/lib/autonomous/notify.log 2>/dev/null & journalctl -u gh-bridge -u herdr -f' ;;  # hook + units: journalctl ANDs -t with -u, so show both
   restart) exec systemctl restart herdr gh-bridge ;;
   update)  exec bash /opt/autonomous/install.sh ;;
   attach)  exec sudo -iu agent herdr ;;

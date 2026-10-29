@@ -35,7 +35,7 @@ The agent listens only to you (the `GH_TOKEN` account) and to people in `allow_a
 | `agent:working` | the agent is working | nothing, wait |
 | `agent:needs-input` | the agent asks something | answer in a comment |
 | `agent:ready` | PR ready, reviewed | review it → `/approve` |
-| `agent:failed` | something broke | a comment with a hint, or `/stop` |
+| `agent:failed` | something broke | the bridge re-drives it; else a hint, or `/stop` |
 | `agent:done` | merged | 🎉 |
 
 Release: label the **PR** `release:minor` / `release:major` / `release:none`; no label = patch.

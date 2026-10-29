@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +44,7 @@ LABELS = {
 }
 EVENT_TO_LABEL = {"needs you": "agent:needs-input", "ready to approve": "agent:ready", "failed": "agent:failed"}
 STATE_TO_LABEL = {"working": "agent:working", "blocked": "agent:needs-input", "error": "agent:failed", "done": "agent:done"}
+MAX_AUTO_RECOVER = 2  # without config: a failed task is re-driven this many times, then left for the human
 
 
 def log(*a):
@@ -66,6 +68,7 @@ def load_config() -> dict:
     b.setdefault("poll_interval_max", 300)
     b.setdefault("poll_backoff_factor", 1.5)
     b.setdefault("quiet_window", 90)
+    b.setdefault("auto_recover_max", MAX_AUTO_RECOVER)
     b.setdefault("repos_dir", str(Path.home() / "repos"))
     b.setdefault("herdr_projects", str(Path.home() / ".herdr-projects/data/bin/herdr-projects"))
     g = cfg.setdefault("github", {})
@@ -161,6 +164,8 @@ def db() -> sqlite3.Connection:
         primary key(repo, issue))""")
     if "kind" not in [r[1] for r in c.execute("pragma table_info(tasks)")]:  # a db from before consult mode
         c.execute("alter table tasks add column kind text default 'work'")
+    if "fixes" not in [r[1] for r in c.execute("pragma table_info(tasks)")]:  # a db from before auto-recovery
+        c.execute("alter table tasks add column fixes integer default 0")
     return c
 
 
@@ -191,16 +196,85 @@ def apply_state(c, task_id: str, label: str | None, note: str = "", state: str |
     return True
 
 
-def notes_for(label: str, task: dict, repo: str, task_id: str) -> str:
+def one_line(text, limit: int = 300) -> str:
+    s = " ".join(str(text).split())
+    return s[:limit] + ("…" if len(s) > limit else "")
+
+
+def failure_text(task: dict, failure: dict | None) -> str:
+    """The board's own words about what went wrong: its title, the details (the command and the error) and the next step."""
+    f = failure if isinstance(failure, dict) else {}
+    parts = [str(f.get("title") or task.get("msg") or "the task failed").strip(),
+             str(f.get("detail") or "").strip(),
+             str(f.get("next") or "").strip()]
+    text = "\n\n".join(p for p in parts if p)
+    return text[:1800] + ("…" if len(text) > 1800 else "")
+
+
+def notes_for(label: str, task: dict, repo: str, task_id: str, failure: dict | None = None) -> str:
     msg = (task.get("msg") or "").strip()
     pr = task.get("pr")
     pr_ref = f"https://github.com/{repo}/pull/{pr}" if isinstance(pr, int) or str(pr).isdigit() else (pr or "")
     return {
         "agent:needs-input": f"🤖 The agent on `{task_id}` needs an answer:\n\n> {msg or '(see the board)'}\n\nReply in a comment here.",
         "agent:ready": f"✅ `{task_id}` passed checks and review. PR: {pr_ref}\n\nComment `/approve` to merge, or leave review comments on the PR.",
-        "agent:failed": f"❌ `{task_id}` failed: {msg or 'see the board'}\n\nComment to give the agent a hint, or `/stop`.",
+        "agent:failed": f"❌ `{task_id}` failed:\n\n{failure_text(task, failure)}\n\nComment to give the agent a hint, or `/stop`.",
         "agent:done": f"🚀 `{task_id}` is merged. {pr_ref}",
     }.get(label, "")
+
+
+def board_failure(cfg: dict, task_id: str) -> dict | None:
+    """The board's failure object for a task: the command and error the compact list rows do not carry."""
+    d = hp(cfg, "details", task_id, check=False)
+    return d.get("failure") if isinstance(d, dict) else None
+
+
+def claim_fix(c, task_id: str, limit: int) -> bool:
+    """Reserve one auto-fix attempt atomically, so two bridge processes cannot send the same failure twice."""
+    c.execute("begin immediate")
+    try:
+        row = c.execute("select coalesce(fixes, 0) as fixes from tasks where task_id=?", (task_id,)).fetchone()
+        if not row or row["fixes"] >= limit:
+            c.execute("commit")
+            return False
+        c.execute("update tasks set fixes=coalesce(fixes,0)+1 where task_id=?", (task_id,))
+        c.execute("commit")
+        return True
+    except Exception:
+        c.execute("rollback")
+        raise
+
+
+def hp_result(cfg: dict, *args: str):
+    """Like hp(), but keeps the exit code, so a best-effort command (fix, retry) can tell its own failure."""
+    p = subprocess.run([cfg["bridge"]["herdr_projects"], *args, "--json"], capture_output=True, text=True)
+    try:
+        out = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        out = {"raw": (p.stdout or p.stderr).strip()}
+    return p.returncode == 0, out
+
+
+def auto_recover(cfg: dict, c, task_id: str, failure: dict | None) -> bool:
+    """Re-drive a failed task, so the issue starts instead of staying stuck on agent:failed.
+
+    The board's own next step decides how: `fix` sends the details to an agent that can act on them, else `retry`
+    repeats the step that failed (a setup that was transient, an agent that never took its instructions).
+    """
+    f = failure if isinstance(failure, dict) else {}
+    limit = int(cfg["bridge"].get("auto_recover_max", MAX_AUTO_RECOVER))
+    if limit <= 0 or f.get("auth") or f.get("sentAt") or not claim_fix(c, task_id, limit):
+        return False
+    cmd = "fix" if f.get("agentCanFix") else "retry"
+    ok, out = hp_result(cfg, cmd, task_id)
+    detail = out.get("raw") if isinstance(out, dict) and out.get("raw") else ("sent back" if ok else "no answer")
+    if not ok:
+        log(f"{task_id}: {cmd} failed: {one_line(detail)}")
+        return False
+    log(f"{task_id}: {cmd} ({one_line(detail)})")
+    # The re-drive put the task back to work: clear agent:failed now, not on some later poll.
+    apply_state(c, task_id, "agent:working", state="working")
+    return True
 
 
 # ---------------------------------------------------------------- the three jobs
@@ -322,14 +396,21 @@ def sync_states(cfg: dict, c):
             if state == "done":
                 changed = apply_state(c, row["task_id"], None, state="closed") or changed
             else:
-                changed = apply_state(c, row["task_id"], "agent:failed" if state == "error" else "agent:consulting",
-                                      notes_for("agent:failed", t, row["repo"], row["task_id"]) if state == "error" else "") or changed
+                label = "agent:failed" if state == "error" else "agent:consulting"
+                failure = board_failure(cfg, row["task_id"]) if state == "error" else None
+                changed = apply_state(c, row["task_id"], label,
+                                      notes_for("agent:failed", t, row["repo"], row["task_id"], failure) if state == "error" else "") or changed
+                if state == "error":
+                    auto_recover(cfg, c, row["task_id"], failure)
             continue
         label = "agent:ready" if (state, stage) == ("blocked", "approval") else STATE_TO_LABEL.get(state)
         if label is None:
             continue
-        changed = apply_state(c, row["task_id"], label, notes_for(label, t, row["repo"], row["task_id"]) if label != "agent:working" else "",
+        failure = board_failure(cfg, row["task_id"]) if label == "agent:failed" else None
+        changed = apply_state(c, row["task_id"], label, notes_for(label, t, row["repo"], row["task_id"], failure) if label != "agent:working" else "",
                               state="done" if state == "done" else state) or changed
+        if label == "agent:failed":
+            auto_recover(cfg, c, row["task_id"], failure)
     return changed
 
 
@@ -342,7 +423,7 @@ def cmd_once(cfg) -> bool:
         try:
             did_work = job(cfg, c) or did_work
         except Exception as e:  # one failing job (rate limit, a repo gone) must not stop the others
-            log(f"{job.__name__}: {e}")
+            log(f"{job.__name__}: {e}\n{traceback.format_exc().rstrip()}")  # the full traceback, so a crash is explainable
     return did_work
 
 
@@ -365,11 +446,21 @@ def cmd_notify(cfg):
     tid, event = os.environ.get("HERDR_PROJECTS_ID", ""), os.environ.get("HERDR_PROJECTS_EVENT", "")
     label = EVENT_TO_LABEL.get(event)
     c = db()
-    row = c.execute("select * from tasks where task_id=?", (tid,)).fetchone()
-    if not label or not row or (row["kind"] == "consult" and event != "failed"):
-        return  # a task not started from GitHub, or a consult's turn end (the agent answers on the issue itself)
-    t = next((x for x in hp(cfg, "list", "--all") if isinstance(x, dict) and x.get("id") == tid), {})
-    apply_state(c, tid, label, notes_for(label, t, row["repo"], tid))
+    try:
+        row = c.execute("select * from tasks where task_id=?", (tid,)).fetchone()
+        if not label or not row or (row["kind"] == "consult" and event != "failed"):
+            return  # a task not started from GitHub, or a consult's turn end (the agent answers on the issue itself)
+        t = next((x for x in hp(cfg, "list", "--all") if isinstance(x, dict) and x.get("id") == tid), {})
+        if t.get("id") == tid:  # record what this hook acted on, exactly as a poll does
+            c.execute("update tasks set board_state=? where task_id=?", (f"{t.get('state', '')}/{t.get('stage') or ''}", tid))
+        failure = board_failure(cfg, tid) if label == "agent:failed" else None
+        if label == "agent:failed":
+            log(f"{tid}: board {event}: {one_line(failure_text(t, failure))}")  # the why, in the journal: the list row has only "Setup failed"
+        apply_state(c, tid, label, notes_for(label, t, row["repo"], tid, failure))
+        if label == "agent:failed":
+            auto_recover(cfg, c, tid, failure)
+    finally:
+        c.close()
 
 
 def cmd_status(cfg):
@@ -397,6 +488,7 @@ def cmd_apply_settings(cfg):
     for k, v in cfg.get("herdr_projects", {}).items():
         out = hp(cfg, "set", k, str(v).lower() if isinstance(v, bool) else str(v), check=False)
         log(f"set {k} = {v}: {out.get('raw') if isinstance(out, dict) and 'raw' in out else 'ok'}")
+    # `autonomous logs` tails this file next to the journal: the detached hook cannot share the bridge's journal unit.
     notify = f"{ROOT / 'bridge.py'} notify >> {STATE_DIR / 'notify.log'} 2>&1"
     hp(cfg, "set", "board.notify", notify, check=False)
     log(f"set board.notify = {notify}")

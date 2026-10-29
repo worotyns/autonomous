@@ -150,12 +150,15 @@ tests/scenario.sh work        # start -> draft PR -> review -> agent:ready -> /a
 tests/scenario.sh consult     # consult -> agent answer -> "write it up" -> start -> PR -> merge + release
 tests/scenario.sh pr-comment  # ready PR -> comment on the PR -> new commit -> ready -> /approve
 tests/scenario.sh parallel    # two repos at once; both tasks run in parallel
+tests/scenario.sh autofix     # a broken setup -> agent:failed -> the bridge re-drives it -> agent:working
 tests/scenario.sh all         # reset, then all of the above in order
 tests/scenario.sh reset       # reset only
 ```
 
 Each command resets the sandbox repos first. `all` resets once and then runs work → consult → parallel →
-pr-comment, so every later scenario builds on the code the earlier ones merged.
+pr-comment → autofix, so every later scenario builds on the code the earlier ones merged.
+`autofix` writes a failing `workspace.setup` into `.herdr-projects.json` on `main` for the run and puts the
+branch back afterwards (also on failure, via a trap).
 
 Timeouts are generous because TCG is slow: `READY_TIMEOUT=2400` (40 min), `MERGE_TIMEOUT=900`,
 `RELEASE_TIMEOUT=900`, `POLL=15` seconds. Override them in the environment.
@@ -168,6 +171,7 @@ Timeouts are generous because TCG is slow: `READY_TIMEOUT=2400` (40 min), `MERGE
 | `consult` | `agent:consulting`, an agent comment, issue body rewritten with `## Acceptance criteria`, then a normal work task, merge, `history_calc.py` on `main` |
 | `pr-comment` | a PR comment creates a new commit, the task returns to `agent:ready`, merge, `mod` on `main` |
 | `parallel` | both issues are `agent:working` at the same time, both PRs become ready, both merge |
+| `autofix` | a task that fails setup gets the failure comment and is re-driven back to `agent:working` (the label does not stay `agent:failed`) |
 
 While it runs, watch the environment:
 
