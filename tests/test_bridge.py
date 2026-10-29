@@ -40,7 +40,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg["bridge"]["poll_interval"], 30)
         self.assertEqual(cfg["bridge"]["poll_interval_max"], 300)
         self.assertEqual(cfg["bridge"]["poll_backoff_factor"], 1.5)
-        self.assertEqual(cfg["bridge"]["auto_fix_max"], 2)
+        self.assertEqual(cfg["bridge"]["auto_recover_max"], 2)
 
     def test_backoff_is_configurable(self):
         cfg = self._load("[bridge]\npoll_interval = 10\npoll_interval_max = 45\npoll_backoff_factor = 2.0\n")
@@ -176,46 +176,50 @@ class JobActivityTest(unittest.TestCase):
 
 
 class FailureHandlingTest(unittest.TestCase):
-    """A failed task's reason must reach the issue and the log, and a fixable one must be sent back to the agent."""
+    """A failure's reason reaches the issue and the log, and the bridge re-drives it so the issue starts."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.old_state = bridge.STATE_DIR
         bridge.STATE_DIR = Path(self.tmp.name)
         self.c = bridge.db()
+        # The pre-failure state is already working/working, the worst case for the board_state gate below.
         self.c.execute(
             "insert into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
             " values(?,?,?,?,?,?,?,?,?,?)",
             ("a/b", 1, "T-1", "working", "agent:working", "2020-01-01T00:00:00Z",
-             "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "working/", "work"))
+             "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "working/working", "work"))
 
     def tearDown(self):
         self.c.close()
         bridge.STATE_DIR = self.old_state
         self.tmp.cleanup()
 
-    def _hp(self, calls, failure):
-        def fake(cfg, *args, **kw):
+    def _notify(self, failure):
+        calls, runs, recover = [], [], []
+
+        def fake_hp(cfg, *args, **kw):
             calls.append(args)
             if args[0] == "list":
                 return [{"id": "T-1", "state": "error", "stage": "failed", "msg": "Setup failed"}]
             if args[0] == "details":
                 return {"failure": failure}
             return {"raw": "sent to the agent"}
-        return fake
 
-    def _notify(self, failure):
-        calls, runs = [], []
+        def fake_recover(cfg, *args):
+            recover.append(args)
+            return True, {"raw": "sent to the agent"}
 
         def fake_run(args, check=True, input=None):
             runs.append(args)
             return ""
 
-        with mock.patch.object(bridge, "hp", side_effect=self._hp(calls, failure)), \
+        with mock.patch.object(bridge, "hp", side_effect=fake_hp), \
+             mock.patch.object(bridge, "hp_result", side_effect=fake_recover), \
              mock.patch.object(bridge, "run", side_effect=fake_run), \
              mock.patch.dict(bridge.os.environ, {"HERDR_PROJECTS_ID": "T-1", "HERDR_PROJECTS_EVENT": "failed"}):
             bridge.cmd_notify(make_cfg())
-        return calls, runs
+        return calls, runs, recover
 
     def test_failure_text_has_the_board_reason(self):
         text = bridge.failure_text({"msg": "Setup failed"},
@@ -224,30 +228,62 @@ class FailureHandlingTest(unittest.TestCase):
         self.assertIn("Command: uv venv venv", text)
         self.assertIn("Fix the setup problem", text)
 
-    def test_notify_posts_the_detail_and_sends_a_fixable_failure_back(self):
+    def test_notify_posts_the_detail_and_fixes_an_agent_fixable_failure(self):
         failure = {"stage": "setup", "title": "Setup failed", "detail": "Command: uv venv venv\n\nerror: no venv found",
                    "next": "Fix the setup problem in the working folder.", "agentCanFix": True, "sentAt": None}
-        calls, runs = self._notify(failure)
-        self.assertIn(("fix", "T-1"), [a[:2] for a in calls])
+        _, runs, recover = self._notify(failure)
+        self.assertEqual(recover, [("fix", "T-1")])
         body = next(a[-1] for a in runs if a[:3] == ["gh", "issue", "comment"])
         self.assertIn("Command: uv venv venv", body)
         self.assertIn("Fix the setup problem", body)
 
-    def test_unfixable_failure_is_not_sent_back(self):
-        failure = {"title": "Needs a login", "detail": "gh is not logged in", "auth": True, "agentCanFix": False}
-        calls, _ = self._notify(failure)
-        self.assertNotIn("fix", [a[0] for a in calls])
+    def test_notify_retries_a_failure_the_agent_cannot_fix(self):
+        # The live terapeuto/3 case: the agent never took its instructions, and the board's next step is `retry`.
+        failure = {"stage": "send", "title": "The agent has not started on its instructions",
+                   "agentCanFix": False, "auth": False, "sentAt": None}
+        _, _, recover = self._notify(failure)
+        self.assertEqual(recover, [("retry", "T-1")])
 
-    def test_a_failure_is_sent_back_at_most_auto_fix_max_times(self):
+    def test_auth_failure_is_not_recovered(self):
+        _, _, recover = self._notify({"stage": "agent", "title": "Needs a login", "auth": True,
+                                      "agentCanFix": False, "sentAt": None})
+        self.assertEqual(recover, [])
+
+    def test_a_failure_is_recovered_at_most_auto_recover_max_times(self):
         self.c.execute("update tasks set fixes=2 where task_id='T-1'")
-        calls, _ = self._notify({"title": "Setup failed", "detail": "boom", "agentCanFix": True, "sentAt": None})
-        self.assertNotIn("fix", [a[0] for a in calls])
+        _, _, recover = self._notify({"title": "Setup failed", "agentCanFix": True, "sentAt": None})
+        self.assertEqual(recover, [])
 
-    def test_sync_states_auto_fixes_a_new_failure(self):
+    def test_notify_records_the_board_state(self):
+        self._notify({"title": "Agent stopped", "agentCanFix": True, "sentAt": None})
+        row = self.c.execute("select board_state from tasks where task_id='T-1'").fetchone()
+        self.assertEqual(row["board_state"], "error/failed")
+
+    def test_notify_flips_the_label_back_after_a_successful_redrive(self):
+        self._notify({"title": "Agent stopped", "agentCanFix": True, "sentAt": None})
+        row = self.c.execute("select label from tasks where task_id='T-1'").fetchone()
+        self.assertEqual(row["label"], "agent:working")
+
+    def test_a_poll_clears_agent_failed_when_the_board_recovers_without_a_redrive(self):
+        # The regression the reviewer found: notify sets agent:failed but used to leave board_state untouched, so
+        # a board that recovers on its own left the poll seeing no change and the label stayed failed. With the
+        # redrive budget spent, auto-recover is off and the poll alone must clear it.
+        self.c.execute("update tasks set fixes=2 where task_id='T-1'")
+        self._notify({"title": "Agent stopped", "agentCanFix": True, "sentAt": None})
+        row = self.c.execute("select label from tasks where task_id='T-1'").fetchone()
+        self.assertEqual(row["label"], "agent:failed")
+        board = [{"id": "T-1", "state": "working", "stage": "working", "msg": "Working"}]
+        with mock.patch.object(bridge, "hp", return_value=board), \
+             mock.patch.object(bridge, "run", return_value=""):
+            self.assertTrue(bridge.sync_states(make_cfg(), self.c))
+        row = self.c.execute("select label from tasks where task_id='T-1'").fetchone()
+        self.assertEqual(row["label"], "agent:working")
+
+    def test_sync_states_recovers_a_new_failure(self):
         failure = {"title": "Setup failed", "detail": "Command: uv venv venv", "agentCanFix": True, "sentAt": None}
-        calls = []
+        calls, recover = [], []
 
-        def fake(cfg, *args, **kw):
+        def fake_hp(cfg, *args, **kw):
             calls.append(args)
             if args[0] == "list":
                 return [{"id": "T-1", "state": "error", "stage": "failed", "msg": "Setup failed"}]
@@ -255,10 +291,15 @@ class FailureHandlingTest(unittest.TestCase):
                 return {"failure": failure}
             return {"raw": "sent"}
 
-        with mock.patch.object(bridge, "hp", side_effect=fake), \
+        def fake_recover(cfg, *args):
+            recover.append(args)
+            return True, {"raw": "sent"}
+
+        with mock.patch.object(bridge, "hp", side_effect=fake_hp), \
+             mock.patch.object(bridge, "hp_result", side_effect=fake_recover), \
              mock.patch.object(bridge, "run", return_value=""):
             self.assertTrue(bridge.sync_states(make_cfg(), self.c))
-        self.assertIn(("fix", "T-1"), [a[:2] for a in calls])
+        self.assertEqual(recover, [("fix", "T-1")])
 
 
 if __name__ == "__main__":

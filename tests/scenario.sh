@@ -5,7 +5,8 @@
 #   tests/scenario.sh consult     # consult -> agent answers -> "write it up" -> start -> PR -> merged
 #   tests/scenario.sh pr-comment  # ready PR -> comment on the PR -> new commit -> ready -> merged
 #   tests/scenario.sh parallel    # two repos at once, both tasks run in parallel
-#   tests/scenario.sh all         # reset, then work, consult, parallel, pr-comment
+#   tests/scenario.sh autofix     # a broken setup -> agent:failed -> the bridge re-drives it -> agent:working
+#   tests/scenario.sh all         # reset, then work, consult, parallel, pr-comment, autofix
 #   tests/scenario.sh reset       # close stale issues/PRs, delete branches, reset main to test-base
 #
 # The sandbox repos and their base tag (default `test-base`) are described in tests/README.md.
@@ -112,6 +113,31 @@ wait_pr_change() {
       return 0
     fi
     [ "$(elapsed "$start")" -lt "$timeout" ] || die "timeout waiting for a new commit on $repo PR #$pr"
+    sleep "$POLL"
+  done
+}
+
+wait_failure_comment() {
+  local repo=$1 n=$2 timeout=${3:-$READY_TIMEOUT} start; start=$(now)
+  while :; do
+    if gh issue view "$n" --repo "$repo" --json comments --jq '.comments[].body' | grep -q 'failed:'; then
+      log "$repo#$n has the failure comment ($(elapsed "$start")s)"
+      return 0
+    fi
+    [ "$(elapsed "$start")" -lt "$timeout" ] || die "timeout waiting for the failure comment on $repo#$n"
+    sleep "$POLL"
+  done
+}
+
+# After a failure the bridge re-drives the task; the label must come back to agent:working, not stay agent:failed.
+wait_recovery() {
+  local repo=$1 n=$2 timeout=${3:-$READY_TIMEOUT} start; start=$(now)
+  while :; do
+    if has_label "$repo" "$n" agent:working; then
+      log "$repo#$n recovered to agent:working ($(elapsed "$start")s)"
+      return 0
+    fi
+    [ "$(elapsed "$start")" -lt "$timeout" ] || die "timeout waiting for $repo#$n to recover to agent:working"
     sleep "$POLL"
   done
 }
@@ -300,22 +326,48 @@ Nothing else.')
   verify_file "$REPO_A" calc.py "def mod"
 }
 
+do_autofix() {
+  local path=.herdr-projects.json n orig_sha new_content tip
+  orig_sha=$(gh api "repos/$REPO_A/contents/$path?ref=main" --jq '.sha')
+  new_content=$(gh api "repos/$REPO_A/contents/$path?ref=main" --jq '.content' | base64 -d \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); d.setdefault("workspace",{})["setup"]="false"; print(json.dumps(d, indent=2))' \
+    | base64 | tr -d '\n')
+  tip=$(gh api "repos/$REPO_A/git/ref/heads/main" --jq '.object.sha')
+  restore_main() { gh api -X PATCH "repos/$REPO_A/git/refs/heads/main" -f sha="$tip" -F force=true >/dev/null 2>&1 || true; }
+  trap restore_main EXIT
+  log "$REPO_A: breaking workspace.setup on main for the autofix scenario"
+  gh api -X PUT "repos/$REPO_A/contents/$path" -f message="test: break workspace.setup (autofix scenario)" \
+    -f content="$new_content" -f sha="$orig_sha" >/dev/null
+
+  n=$(create_issue "$REPO_A" "Autofix probe" "$work_issue_body")
+  add_label "$REPO_A" "$n" start
+  wait_failure_comment "$REPO_A" "$n"
+  wait_recovery "$REPO_A" "$n"
+  log "$REPO_A#$n: the bridge re-drove the failed task"
+
+  restore_main
+  trap - EXIT
+  gh issue close "$n" --repo "$REPO_A" --comment "Autofix scenario done." >/dev/null 2>&1 || true
+}
+
 case "${1:-help}" in
   reset) reset_repos ;;
   work) reset_repos; do_work ;;
   consult) reset_repos; do_consult ;;
   parallel) reset_repos; do_parallel ;;
   pr-comment) reset_repos; do_pr_comment ;;
+  autofix) reset_repos; do_autofix ;;
   all)
     reset_repos
     do_work
     do_consult
     do_parallel
     do_pr_comment
+    do_autofix
     log "all scenarios passed"
     ;;
   help|--help|-h)
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     ;;
-  *) die "usage: $0 reset|work|consult|parallel|pr-comment|all" ;;
+  *) die "usage: $0 reset|work|consult|parallel|pr-comment|autofix|all" ;;
 esac
