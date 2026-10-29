@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -489,11 +488,8 @@ def cmd_apply_settings(cfg):
     for k, v in cfg.get("herdr_projects", {}).items():
         out = hp(cfg, "set", k, str(v).lower() if isinstance(v, bool) else str(v), check=False)
         log(f"set {k} = {v}: {out.get('raw') if isinstance(out, dict) and 'raw' in out else 'ok'}")
-    log_file = STATE_DIR / "notify.log"
-    if shutil.which("systemd-cat"):  # the notify hook runs detached; the journal is where `autonomous logs` looks
-        notify = f"{ROOT / 'bridge.py'} notify 2>&1 | tee -a {log_file} | systemd-cat -t gh-bridge-notify"
-    else:
-        notify = f"{ROOT / 'bridge.py'} notify >> {log_file} 2>&1"
+    # `autonomous logs` tails this file next to the journal: the detached hook cannot share the bridge's journal unit.
+    notify = f"{ROOT / 'bridge.py'} notify >> {STATE_DIR / 'notify.log'} 2>&1"
     hp(cfg, "set", "board.notify", notify, check=False)
     log(f"set board.notify = {notify}")
     for r in cfg["repo"]:
