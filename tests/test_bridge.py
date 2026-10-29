@@ -40,6 +40,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg["bridge"]["poll_interval"], 30)
         self.assertEqual(cfg["bridge"]["poll_interval_max"], 300)
         self.assertEqual(cfg["bridge"]["poll_backoff_factor"], 1.5)
+        self.assertEqual(cfg["bridge"]["auto_fix_max"], 2)
 
     def test_backoff_is_configurable(self):
         cfg = self._load("[bridge]\npoll_interval = 10\npoll_interval_max = 45\npoll_backoff_factor = 2.0\n")
@@ -172,6 +173,92 @@ class JobActivityTest(unittest.TestCase):
              mock.patch.object(bridge, "run") as run:
             self.assertFalse(bridge.sync_states(make_cfg(), self.c))
         run.assert_not_called()
+
+
+class FailureHandlingTest(unittest.TestCase):
+    """A failed task's reason must reach the issue and the log, and a fixable one must be sent back to the agent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_state = bridge.STATE_DIR
+        bridge.STATE_DIR = Path(self.tmp.name)
+        self.c = bridge.db()
+        self.c.execute(
+            "insert into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
+            " values(?,?,?,?,?,?,?,?,?,?)",
+            ("a/b", 1, "T-1", "working", "agent:working", "2020-01-01T00:00:00Z",
+             "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "working/", "work"))
+
+    def tearDown(self):
+        self.c.close()
+        bridge.STATE_DIR = self.old_state
+        self.tmp.cleanup()
+
+    def _hp(self, calls, failure):
+        def fake(cfg, *args, **kw):
+            calls.append(args)
+            if args[0] == "list":
+                return [{"id": "T-1", "state": "error", "stage": "failed", "msg": "Setup failed"}]
+            if args[0] == "details":
+                return {"failure": failure}
+            return {"raw": "sent to the agent"}
+        return fake
+
+    def _notify(self, failure):
+        calls, runs = [], []
+
+        def fake_run(args, check=True, input=None):
+            runs.append(args)
+            return ""
+
+        with mock.patch.object(bridge, "hp", side_effect=self._hp(calls, failure)), \
+             mock.patch.object(bridge, "run", side_effect=fake_run), \
+             mock.patch.dict(bridge.os.environ, {"HERDR_PROJECTS_ID": "T-1", "HERDR_PROJECTS_EVENT": "failed"}):
+            bridge.cmd_notify(make_cfg())
+        return calls, runs
+
+    def test_failure_text_has_the_board_reason(self):
+        text = bridge.failure_text({"msg": "Setup failed"},
+                                   {"title": "Setup failed", "detail": "Command: uv venv venv\nerror: no venv found",
+                                    "next": "Fix the setup problem in the working folder."})
+        self.assertIn("Command: uv venv venv", text)
+        self.assertIn("Fix the setup problem", text)
+
+    def test_notify_posts_the_detail_and_sends_a_fixable_failure_back(self):
+        failure = {"stage": "setup", "title": "Setup failed", "detail": "Command: uv venv venv\n\nerror: no venv found",
+                   "next": "Fix the setup problem in the working folder.", "agentCanFix": True, "sentAt": None}
+        calls, runs = self._notify(failure)
+        self.assertIn(("fix", "T-1"), [a[:2] for a in calls])
+        body = next(a[-1] for a in runs if a[:3] == ["gh", "issue", "comment"])
+        self.assertIn("Command: uv venv venv", body)
+        self.assertIn("Fix the setup problem", body)
+
+    def test_unfixable_failure_is_not_sent_back(self):
+        failure = {"title": "Needs a login", "detail": "gh is not logged in", "auth": True, "agentCanFix": False}
+        calls, _ = self._notify(failure)
+        self.assertNotIn("fix", [a[0] for a in calls])
+
+    def test_a_failure_is_sent_back_at_most_auto_fix_max_times(self):
+        self.c.execute("update tasks set fixes=2 where task_id='T-1'")
+        calls, _ = self._notify({"title": "Setup failed", "detail": "boom", "agentCanFix": True, "sentAt": None})
+        self.assertNotIn("fix", [a[0] for a in calls])
+
+    def test_sync_states_auto_fixes_a_new_failure(self):
+        failure = {"title": "Setup failed", "detail": "Command: uv venv venv", "agentCanFix": True, "sentAt": None}
+        calls = []
+
+        def fake(cfg, *args, **kw):
+            calls.append(args)
+            if args[0] == "list":
+                return [{"id": "T-1", "state": "error", "stage": "failed", "msg": "Setup failed"}]
+            if args[0] == "details":
+                return {"failure": failure}
+            return {"raw": "sent"}
+
+        with mock.patch.object(bridge, "hp", side_effect=fake), \
+             mock.patch.object(bridge, "run", return_value=""):
+            self.assertTrue(bridge.sync_states(make_cfg(), self.c))
+        self.assertIn(("fix", "T-1"), [a[:2] for a in calls])
 
 
 if __name__ == "__main__":

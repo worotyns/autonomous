@@ -5,6 +5,7 @@
 poll_interval       = 60    # seconds between GitHub polls when there is activity
 poll_interval_max   = 300   # longest sleep once the bridge has been idle
 poll_backoff_factor = 1.5   # after each quiet poll wait poll_interval * factor, capped at max
+auto_fix_max        = 2     # send an agent-fixable failure back to it, so it starts (0: never, leave it for you)
 quiet_window        = 90    # wait this long after the last issue comment before passing comments to the agent
 # repos_dir      = "/home/agent/repos"
 # herdr_projects = "/home/agent/.herdr-projects/data/bin/herdr-projects"
