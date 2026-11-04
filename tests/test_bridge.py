@@ -18,7 +18,8 @@ import bridge  # noqa: E402
 
 def make_cfg(**bridge_cfg) -> dict:
     cfg = {
-        "bridge": {"poll_interval": 60, "poll_interval_max": 300, "poll_backoff_factor": 1.5, "quiet_window": 90},
+        "bridge": {"poll_interval": 60, "poll_interval_max": 300, "poll_backoff_factor": 1.5, "quiet_window": 90,
+                   "herdr_projects": "/nonexistent/herdr-projects"},
         "github": {"start_label": "start", "allow_authors": []},
         "consult": {"label": "consult", "agent": ""},
         "repo": [],
@@ -122,6 +123,7 @@ class JobActivityTest(unittest.TestCase):
         with mock.patch.object(bridge, "gh_user", return_value="bot"), \
              mock.patch.object(bridge, "gh_api", side_effect=fake_api), \
              mock.patch.object(bridge, "labeled_by", return_value="alice"), \
+             mock.patch.object(bridge, "hp", return_value=[]), \
              mock.patch.object(bridge, "start_task") as start_task:
             self.assertTrue(bridge.pick_up_issues(cfg, self.c))
         start_task.assert_called_once()
@@ -300,6 +302,147 @@ class FailureHandlingTest(unittest.TestCase):
              mock.patch.object(bridge, "run", return_value=""):
             self.assertTrue(bridge.sync_states(make_cfg(), self.c))
         self.assertEqual(recover, [("fix", "T-1")])
+
+
+class DuplicateGuardTest(unittest.TestCase):
+    """One GitHub issue gets at most one board task, even after bridge.db lost the row."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_state = bridge.STATE_DIR
+        bridge.STATE_DIR = Path(self.tmp.name)
+        self.c = bridge.db()
+
+    def tearDown(self):
+        self.c.close()
+        bridge.STATE_DIR = self.old_state
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _desc(kind="work"):
+        head = ("Consultation on GitHub issue" if kind == "consult" else "GitHub issue") + " a/b#7: Add a widget"
+        return {"task": {"description": f"{head}\nhttps://github.com/a/b/issues/7\n\nplease add it\n"}}
+
+    def _pick(self, hp_side_effect):
+        """Run pick_up_issues for one `start` issue with hp mocked; returns (started, start_task mock, conn)."""
+        issue = {"number": 7, "title": "Add a widget", "html_url": "https://github.com/a/b/issues/7",
+                 "body": "please add it", "labels": [{"name": "start"}]}
+        cfg = make_cfg()
+        cfg["github"]["allow_authors"] = ["alice"]
+        cfg["repo"] = [{"name": "a/b", "path": "/nowhere/a/b"}]
+
+        def fake_api(path, *extra, paginate=False):
+            return [issue] if "labels=start" in path else []
+
+        with mock.patch.object(bridge, "gh_user", return_value="bot"), \
+             mock.patch.object(bridge, "gh_api", side_effect=fake_api), \
+             mock.patch.object(bridge, "labeled_by", return_value="alice"), \
+             mock.patch.object(bridge, "hp", side_effect=hp_side_effect), \
+             mock.patch.object(bridge, "run", return_value=""), \
+             mock.patch.object(bridge, "start_task") as start_task:
+            started = bridge.pick_up_issues(cfg, self.c)
+        return started, start_task, self.c
+
+    def test_an_existing_board_task_is_not_added_again(self):
+        def fake_hp(cfg, *args, **kw):
+            return [{"id": "a/b/9", "state": "working"}] if args[0] == "list" else self._desc()
+
+        started, start_task, c = self._pick(fake_hp)
+        start_task.assert_not_called()
+        self.assertFalse(started)
+        row = c.execute("select * from tasks where task_id='a/b/9'").fetchone()  # adopted, so it is tracked now
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "work")
+
+    def test_a_closed_db_row_does_not_hide_a_live_board_task(self):
+        # active() ignores a done row, but the board still has a live task for the issue: adopt it, do not add.
+        self.c.execute(
+            "insert into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
+            " values(?,?,?,?,?,?,?,?,?,?)",
+            ("a/b", 7, "a/b/old", "done", None, "2020-01-01T00:00:00Z",
+             "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "done/", "work"))
+
+        def fake_hp(cfg, *args, **kw):
+            return [{"id": "a/b/9", "state": "working"}] if args[0] == "list" else self._desc()
+
+        _, start_task, c = self._pick(fake_hp)
+        start_task.assert_not_called()
+        row = c.execute("select task_id from tasks where repo='a/b' and issue=7").fetchone()
+        self.assertEqual(row["task_id"], "a/b/9")  # the live task replaced the closed row
+
+    def test_a_done_board_task_does_not_block_a_new_one(self):
+        def fake_hp(cfg, *args, **kw):
+            self.assertEqual(args[0], "list")  # a done row needs no details lookup
+            return [{"id": "a/b/9", "state": "done"}]
+
+        started, start_task, _ = self._pick(fake_hp)
+        start_task.assert_called_once()
+        self.assertTrue(started)
+
+    def test_a_longer_issue_number_is_not_a_match(self):
+        def fake_hp(cfg, *args, **kw):
+            if args[0] == "list":
+                return [{"id": "a/b/70", "state": "working"}]
+            return {"task": {"description": "GitHub issue a/b#70: Other\nhttps://github.com/a/b/issues/70\n"}}
+
+        _, start_task, _ = self._pick(fake_hp)
+        start_task.assert_called_once()
+
+    def test_an_untracked_consult_is_ended_when_start_arrives(self):
+        def fake_hp(cfg, *args, **kw):
+            return [{"id": "a/b/9", "state": "idle"}] if args[0] == "list" else self._desc("consult")
+
+        _, start_task, c = self._pick(fake_hp)
+        start_task.assert_called_once()
+        row = c.execute("select * from tasks where task_id='a/b/9'").fetchone()
+        self.assertEqual(row["state"], "closed")  # the consult was handed over, not left running
+
+
+class StartTaskAdoptTest(unittest.TestCase):
+    """`add` can create the task and then fail; start_task then adopts it instead of raising (decision 4)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_state = bridge.STATE_DIR
+        bridge.STATE_DIR = Path(self.tmp.name)
+        self.c = bridge.db()
+
+    def tearDown(self):
+        self.c.close()
+        bridge.STATE_DIR = self.old_state
+        self.tmp.cleanup()
+
+    def _start(self, found):
+        cfg = make_cfg()
+        r = {"name": "a/b", "path": "/nowhere/a/b"}
+        i = {"number": 7, "title": "Add a widget", "html_url": "https://github.com/a/b/issues/7", "body": "x"}
+        with mock.patch.object(bridge, "hp_result", return_value=(False, {"raw": "interrupted"})), \
+             mock.patch.object(bridge, "board_task_for_issue", return_value=found), \
+             mock.patch.object(bridge, "run", return_value=""), \
+             mock.patch.object(bridge, "set_label") as set_label, \
+             mock.patch.object(bridge, "comment") as comment:
+            bridge.start_task(cfg, self.c, r, i, "work")
+        return set_label, comment
+
+    def test_add_without_an_id_adopts_the_created_task(self):
+        set_label, comment = self._start(("a/b/9", "work"))
+        row = self.c.execute("select * from tasks where task_id='a/b/9'").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["kind"], "work")
+        set_label.assert_called_once()
+        comment.assert_called_once()
+
+    def test_add_without_an_id_and_no_board_task_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._start(None)
+
+
+class SystemdUnitTest(unittest.TestCase):
+    def test_a_herdr_crash_loop_does_not_restart_the_bridge(self):
+        unit = (ROOT / "systemd" / "gh-bridge.service").read_text()
+        self.assertNotIn("Requires=herdr.service", unit)
+        self.assertIn("Wants=herdr.service", unit)
+        self.assertIn("After=herdr.service", unit)
 
 
 if __name__ == "__main__":
