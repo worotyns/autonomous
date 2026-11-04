@@ -37,6 +37,7 @@ MARK_PREFIX = "<!-- autonomous"         # ...and the agent is told to add <!-- a
 LABELS = {
     "agent:consulting": ("c5def5", "An agent discusses this issue with you, no code yet"),
     "agent:working": ("fbca04", "An agent is working on this"),
+    "agent:queued": ("d4c5f9", "Queued: starts by itself once the task ahead in this repo is merged"),
     "agent:needs-input": ("d93f0b", "The agent asked a question: answer in a comment"),
     "agent:ready": ("0e8a16", "Reviewed PR waits for approval"),
     "agent:failed": ("b60205", "The agent or the board hit an error"),
@@ -73,6 +74,7 @@ def load_config() -> dict:
     b.setdefault("herdr_projects", str(Path.home() / ".herdr-projects/data/bin/herdr-projects"))
     g = cfg.setdefault("github", {})
     g.setdefault("start_label", "start")
+    g.setdefault("queue_label", "queue")
     g.setdefault("allow_authors", [])
     k = cfg.setdefault("consult", {})
     k.setdefault("label", "consult")
@@ -291,8 +293,21 @@ def task_labels(cfg: dict, kind: str) -> tuple[str, str]:
     if kind == "consult":
         return "agent:consulting", ("🧠 Consulting on this: board task `{id}`. The agent reads the code and answers "
                                     f"here; it changes nothing. Comment to discuss. Add `{start}` when the issue is ready to build.")
+    if kind == "queue":
+        return "agent:queued", ("🕒 Queued: board task `{id}` waits for this repo's current work and starts by itself once it is merged. "
+                                "Comment here; the bridge passes comments on when it starts.")
     return "agent:working", ("🤖 On it: board task `{id}`. Comment here to talk to the agent; "
                              "PR review comments go to it too.")
+
+
+def task_removals(cfg: dict, kind: str) -> tuple[str, ...]:
+    """The trigger label(s) to drop when a task starts; `work` also clears a stale `queue` trigger."""
+    start, consult, queue = cfg["github"]["start_label"], cfg["consult"]["label"], cfg["github"]["queue_label"]
+    if kind == "consult":
+        return (consult,)
+    if kind == "queue":
+        return (queue,)
+    return (start, queue)
 
 
 def describes_issue(desc: str, repo: str, n: int) -> bool:
@@ -323,8 +338,12 @@ def board_task_for_issue(cfg: dict, repo: str, n: int):
         out = hp(cfg, "details", t["id"], check=False)
         desc = ((out.get("task") or {}).get("description") or "") if isinstance(out, dict) else ""
         if describes_issue(desc, repo, n):
-            kind = "consult" if any(l.strip().startswith("Consultation on GitHub issue")
-                                    for l in desc.splitlines()) else "work"
+            if any(l.strip().startswith("Consultation on GitHub issue") for l in desc.splitlines()):
+                kind = "consult"
+            elif t.get("stage") == "after":  # a queue task that only waits for earlier work
+                kind = "queue"
+            else:
+                kind = "work"
             return t["id"], kind
     return None
 
@@ -336,18 +355,22 @@ def adopt_task(c, repo: str, n: int, task_id: str, kind: str):
               " values(?,?,?,?,?,?,?,?,?,?)", (repo, n, task_id, "working", None, ts, ts, ts, "", kind))
 
 
-def start_task(cfg: dict, c, r: dict, i: dict, kind: str):
+def start_task(cfg: dict, c, r: dict, i: dict, kind: str, after: list[str] | None = None):
+    """Add the issue's board task. `kind` is `work`, `consult` or `queue`; `queue` waits behind `after`."""
     repo, n = r["name"], i["number"]
-    start, consult = cfg["github"]["start_label"], cfg["consult"]["label"]
     body = dict(repo=repo, number=n, title=i["title"], url=i["html_url"], body=i.get("body") or "(no description)")
     settings = [a for k, v in r.get("settings", {}).items() for a in (f"--{k}", str(v))]
     if kind == "consult":
         if cfg["consult"]["agent"]:
             settings += ["--worker.agent", cfg["consult"]["agent"]]
         args = ["--desc", render("consult_from_issue.md", **body), "--chat", "--delegate"]
+    elif kind == "queue":  # the repo has unfinished work: wait for it on the board, do not start an agent
+        args = ["--desc", render("task_from_issue.md", **body), "--merge.closes", str(n),
+                "--after", ",".join(after or []), "--delegate"]
     else:
         args = ["--desc", render("task_from_issue.md", **body), "--merge.closes", str(n), "--delegate"]
     label, hello = task_labels(cfg, kind)
+    remove = task_removals(cfg, kind)
     ok, out = hp_result(cfg, "add", f"{i['title']} (#{n})", "--repo", r["path"], *args, *settings)
     task_id = out.get("id") if isinstance(out, dict) else None
     if not task_id and ok:  # the bare-id fallback is only for a command that succeeded but printed no JSON
@@ -361,9 +384,9 @@ def start_task(cfg: dict, c, r: dict, i: dict, kind: str):
         log(f"{repo}#{n}: add gave no id; adopted board task {task_id}")
     c.execute("insert or replace into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
               " values(?,?,?,?,?,?,?,?,?,?)", (repo, n, task_id, "working", label, now_iso(), now_iso(), now_iso(), "working/", kind))
-    set_label(repo, n, label, also_remove=(start,) if kind == "work" else (consult,))
+    set_label(repo, n, label, also_remove=remove)
     comment(repo, n, hello.format(id=task_id))
-    log(f"{repo}#{n}: started {kind} {task_id}")
+    log(f"{repo}#{n}: started {kind} {task_id}" + (f" after {','.join(after)}" if after else ""))
 
 
 def end_consult(cfg: dict, c, row):
@@ -372,20 +395,42 @@ def end_consult(cfg: dict, c, row):
     log(f"{row['repo']}#{row['issue']}: consult {row['task_id']} ended")
 
 
+def unfinished_work(c, repo: str) -> list[str]:
+    """The ids of the repo's unfinished work/queued tasks, oldest issue first: what a new queue waits behind."""
+    rows = c.execute("select task_id from tasks where repo=? and state not in ('done','closed')"
+                     " and kind in ('work','queue') order by issue", (repo,)).fetchall()
+    return [r["task_id"] for r in rows]
+
+
+def promote_queued(cfg: dict, c, row):
+    """`start` on an already-queued issue: start it now (`delegate --now`) and drop the queue."""
+    start, queue = cfg["github"]["start_label"], cfg["github"]["queue_label"]
+    hp(cfg, "delegate", row["task_id"], "--now", check=False)
+    c.execute("update tasks set kind='work', state='working', label='agent:working', board_state='', updated_at=? where task_id=?",
+              (now_iso(), row["task_id"]))
+    set_label(row["repo"], row["issue"], "agent:working", also_remove=(start, queue))
+    comment(row["repo"], row["issue"],
+            f"🤖 `{start}`: board task `{row['task_id']}` starts now, ahead of the queue. Comment here to talk to the agent.")
+    log(f"{row['repo']}#{row['issue']}: started queued {row['task_id']} with `{start}`")
+
+
 def pick_up_issues(cfg: dict, c):
-    start, consult = cfg["github"]["start_label"], cfg["consult"]["label"]
+    start, consult, queue = cfg["github"]["start_label"], cfg["consult"]["label"], cfg["github"]["queue_label"]
     ok = allowed(cfg)
     started = False
     for r in cfg["repo"]:
         repo = r["name"]
-        for label, kind in ((consult, "consult"), (start, "work")):
-            for i in gh_api(f"repos/{repo}/issues?labels={label}&state=open&per_page=100"):
+        for label, kind in ((consult, "consult"), (start, "work"), (queue, "queue")):
+            issues = sorted(gh_api(f"repos/{repo}/issues?labels={label}&state=open&per_page=100"), key=lambda x: x["number"])
+            for i in issues:
                 n, names = i["number"], {l["name"] for l in i.get("labels", [])}
                 if "pull_request" in i or (kind == "consult" and start in names):
                     continue  # both labels: go straight to work
+                if kind == "queue" and (start in names or consult in names):
+                    continue  # `start` wins over `queue`; a queued consult is not a thing
                 row = active(c, repo, n)
-                if row and (row["kind"] == kind or kind == "consult"):
-                    continue  # already running; a consult label never interrupts work
+                if row and (row["kind"] == kind or kind in ("consult", "queue")):
+                    continue  # already running; a consult/queue label never interrupts work
                 who = labeled_by(repo, n, label)
                 if who.lower() not in ok:
                     set_label(repo, n, row["label"] if row else None, also_remove=(label,))
@@ -399,20 +444,62 @@ def pick_up_issues(cfg: dict, c):
                         adopt_task(c, repo, n, task_id, found_kind)
                         log(f"{repo}#{n}: board task {task_id} already exists; skipping the add")
                         row = active(c, repo, n)
-                        if row and (row["kind"] == kind or kind == "consult"):
+                        if row and (row["kind"] == kind or kind in ("consult", "queue")):
                             # mirror start_task, so an adopted task still labels the issue and greets the human
                             found_label, hello = task_labels(cfg, found_kind)
-                            set_label(repo, n, found_label,
-                                      also_remove=(start,) if found_kind == "work" else (consult,))
+                            set_label(repo, n, found_label, also_remove=task_removals(cfg, found_kind))
+                            c.execute("update tasks set label=? where task_id=?", (found_label, task_id))
                             comment(repo, n, hello.format(id=task_id))
                             continue
+                if row and kind == "work" and row["kind"] == "queue":
+                    promote_queued(cfg, c, row)  # `start` on a queued issue: go now
+                    started = True
+                    continue
                 if row:  # a consult is running and `start` arrived: the issue is ready to build
                     end_consult(cfg, c, row)
                     run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", consult], check=False)
                     i = gh_api(f"repos/{repo}/issues/{n}")  # the body the consult may have rewritten
-                start_task(cfg, c, r, i, kind)
+                after = unfinished_work(c, repo) if kind == "queue" and not row else None
+                start_kind = "queue" if after else ("consult" if kind == "consult" else "work")
+                start_task(cfg, c, r, i, start_kind, after=after)
                 started = True
     return started
+
+
+def waiting_for_start(row) -> bool:
+    """True while the board has not put an agent on this task.
+
+    A queued task waits behind earlier work (stage `after`) or a free slot (stage `queued`). If a task it waits
+    for fails/stops/is archived the board moves it to needs-you, but it still has no agent. A `tell` then either
+    starts it (jumping the queue) or is refused (`No agent has been on … yet`), so its comments must wait too.
+    """
+    stage = (row["board_state"] or "").split("/")[-1]
+    return row["kind"] == "queue" and (row["label"] == "agent:queued" or stage in ("after", "queued"))
+
+
+def deliver_task_comments(cfg: dict, c, row, ok: set[str], quiet: int) -> bool:
+    """Forward one task's new issue comments; moved out of the loop so one refused `tell` cannot stop the rest."""
+    repo, n, tid, cursor = row["repo"], row["issue"], row["task_id"], row["cursor"]
+    new = [x for x in gh_api(f"repos/{repo}/issues/{n}/comments?since={cursor}&per_page=100")
+           if x["created_at"] > cursor and x["user"]["login"].lower() in ok and MARK_PREFIX not in (x["body"] or "")]
+    if not new or age_s(new[-1]["created_at"]) < quiet:  # wait until the human stops typing
+        return False
+    texts, delivered = [], False
+    for x in new:
+        body = x["body"].strip()
+        if body.startswith(("/approve", "/stop")):
+            cmd = "approve" if body.startswith("/approve") else "stop"
+            comment(repo, n, f"🤖 `{tid}`: {said(hp(cfg, cmd, tid, check=False), cmd)}")
+            delivered = True
+        else:
+            texts.append(f"@{x['user']['login']}: {body}")
+    if texts:
+        prompt = "consult_comment.md" if row["kind"] == "consult" else "issue_comment.md"
+        hp(cfg, "tell", tid, render(prompt, repo=repo, number=n, comments="\n\n".join(texts)))
+        log(f"{repo}#{n}: told {tid} {len(texts)} comment(s)")
+        delivered = True
+    c.execute("update tasks set cursor=? where task_id=?", (new[-1]["created_at"], tid))
+    return delivered
 
 
 def deliver_comments(cfg: dict, c):
@@ -420,26 +507,12 @@ def deliver_comments(cfg: dict, c):
     quiet = cfg["bridge"]["quiet_window"]
     delivered = False
     for row in c.execute("select * from tasks where state not in ('done','closed')").fetchall():
-        repo, n, tid, cursor = row["repo"], row["issue"], row["task_id"], row["cursor"]
-        new = [x for x in gh_api(f"repos/{repo}/issues/{n}/comments?since={cursor}&per_page=100")
-               if x["created_at"] > cursor and x["user"]["login"].lower() in ok and MARK_PREFIX not in (x["body"] or "")]
-        if not new or age_s(new[-1]["created_at"]) < quiet:  # wait until the human stops typing
-            continue
-        texts = []
-        for x in new:
-            body = x["body"].strip()
-            if body.startswith(("/approve", "/stop")):
-                cmd = "approve" if body.startswith("/approve") else "stop"
-                comment(repo, n, f"🤖 `{tid}`: {said(hp(cfg, cmd, tid, check=False), cmd)}")
-                delivered = True
-            else:
-                texts.append(f"@{x['user']['login']}: {body}")
-        if texts:
-            prompt = "consult_comment.md" if row["kind"] == "consult" else "issue_comment.md"
-            hp(cfg, "tell", tid, render(prompt, repo=repo, number=n, comments="\n\n".join(texts)))
-            log(f"{repo}#{n}: told {tid} {len(texts)} comment(s)")
-            delivered = True
-        c.execute("update tasks set cursor=? where task_id=?", (new[-1]["created_at"], tid))
+        if waiting_for_start(row):
+            continue  # no agent yet: deliver these once it really starts
+        try:
+            delivered = deliver_task_comments(cfg, c, row, ok, quiet) or delivered
+        except Exception as e:  # one refused tell (a race, a board hiccup) must not block every other task
+            log(f"{row['repo']}#{row['issue']} ({row['task_id']}): comments not delivered: {e}")
     return delivered
 
 
@@ -470,6 +543,8 @@ def sync_states(cfg: dict, c):
                     auto_recover(cfg, c, row["task_id"], failure)
             continue
         label = "agent:ready" if (state, stage) == ("blocked", "approval") else STATE_TO_LABEL.get(state)
+        if row["kind"] == "queue" and state == "working" and stage in ("after", "queued"):
+            label = "agent:queued"  # still waiting behind earlier work (or a free slot)
         if label is None:
             continue
         failure = board_failure(cfg, row["task_id"]) if label == "agent:failed" else None
@@ -544,6 +619,7 @@ def cmd_sync_repos(cfg):
         else:
             run(["git", "-C", str(p), "fetch", "--prune", "--quiet"], check=False)
         extra = {cfg["github"]["start_label"]: ("1d76db", "Start an agent on this issue"),
+                 cfg["github"]["queue_label"]: ("c2e0c6", "Queue: start once this repo's current task is merged"),
                  cfg["consult"]["label"]: ("bfd4f2", "Discuss this issue with an agent before building it")}
         for name, (color, desc) in {**LABELS, **extra}.items():
             run(["gh", "label", "create", name, "--repo", r["name"], "--color", color, "--description", desc, "--force"], check=False)

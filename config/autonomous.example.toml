@@ -12,6 +12,7 @@ quiet_window        = 90    # wait this long after the last issue comment before
 
 [github]
 start_label   = "start"
+queue_label   = "queue"   # start only once this repo's current task is merged (one agent per repo)
 # Who may start an agent and talk to it in issues. The gh user on the VPS is always allowed.
 # herdr-projects itself only lets PR comments of the gh user wake the agent.
 allow_authors = []          # e.g. ["teammate-login"]

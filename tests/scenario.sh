@@ -5,8 +5,9 @@
 #   tests/scenario.sh consult     # consult -> agent answers -> "write it up" -> start -> PR -> merged
 #   tests/scenario.sh pr-comment  # ready PR -> comment on the PR -> new commit -> ready -> merged
 #   tests/scenario.sh parallel    # two repos at once, both tasks run in parallel
+#   tests/scenario.sh queue       # a queue waits for the same repo's task, another repo's queue starts at once
 #   tests/scenario.sh autofix     # a broken setup -> agent:failed -> the bridge re-drives it -> agent:working
-#   tests/scenario.sh all         # reset, then work, consult, parallel, pr-comment, autofix
+#   tests/scenario.sh all         # reset, then work, consult, parallel, queue, pr-comment, autofix
 #   tests/scenario.sh reset       # close stale issues/PRs, delete branches, reset main to test-base
 #
 # The sandbox repos and their base tag (default `test-base`) are described in tests/README.md.
@@ -300,6 +301,74 @@ Nothing else.')
   verify_file "$REPO_B" calc.py "def neg"
 }
 
+do_queue() {
+  local na nq nb pa pq pb
+  # REPO_A: one task runs, a second one is queued behind it and must not start early.
+  na=$(create_issue "$REPO_A" "Add a floor function" '## Context
+Add `floor(a)` to the calculator.
+
+## Acceptance criteria
+- [ ] `floor(2.7)` returns `2`
+- [ ] `floor(-2.1)` returns `-3`
+- [ ] there is a unittest test and `make check` passes
+
+## Out of scope
+Nothing else.')
+  add_label "$REPO_A" "$na" start
+  wait_label "$REPO_A" "$na" agent:working
+
+  nq=$(create_issue "$REPO_A" "Add a ceil function" '## Context
+Add `ceil(a)` to the calculator.
+
+## Acceptance criteria
+- [ ] `ceil(2.1)` returns `3`
+- [ ] `ceil(-2.7)` returns `-2`
+- [ ] there is a unittest test and `make check` passes
+
+## Out of scope
+Nothing else.')
+  add_label "$REPO_A" "$nq" queue
+  wait_label "$REPO_A" "$nq" agent:queued
+  if has_label "$REPO_A" "$nq" agent:working; then
+    die "$REPO_A#$nq started while $REPO_A#$na was still running"
+  fi
+  log "$REPO_A#$nq is queued behind $REPO_A#$na"
+
+  # REPO_B has no unfinished work: its queue starts at once, in parallel with REPO_A.
+  nb=$(create_issue "$REPO_B" "Add an abs function" '## Context
+Add `abs(a)` to the calculator.
+
+## Acceptance criteria
+- [ ] `abs(-5)` returns `5`
+- [ ] `abs(5)` returns `5`
+- [ ] there is a unittest test and `make check` passes
+
+## Out of scope
+Nothing else.')
+  add_label "$REPO_B" "$nb" queue
+  wait_label "$REPO_B" "$nb" agent:working
+
+  # Finish REPO_A's first task: the queued one starts by itself and reaches its own PR.
+  wait_label "$REPO_A" "$na" agent:ready
+  pa=$(get_pr "$REPO_A" "$na")
+  log "PR: https://github.com/$REPO_A/pull/$pa"
+  approve "$REPO_A" "$na"
+  wait_label "$REPO_A" "$nq" agent:working
+  wait_label "$REPO_A" "$nq" agent:ready
+  pq=$(get_pr "$REPO_A" "$nq")
+  log "PR: https://github.com/$REPO_A/pull/$pq"
+  approve "$REPO_A" "$nq"
+
+  wait_label "$REPO_B" "$nb" agent:ready
+  pb=$(get_pr "$REPO_B" "$nb")
+  log "PR: https://github.com/$REPO_B/pull/$pb"
+  approve "$REPO_B" "$nb"
+
+  verify_file "$REPO_A" calc.py "def floor"
+  verify_file "$REPO_A" calc.py "def ceil"
+  verify_file "$REPO_B" calc.py "def abs"
+}
+
 do_pr_comment() {
   local n pr before
   n=$(create_issue "$REPO_A" "Add a modulo function" '## Context
@@ -355,6 +424,7 @@ case "${1:-help}" in
   work) reset_repos; do_work ;;
   consult) reset_repos; do_consult ;;
   parallel) reset_repos; do_parallel ;;
+  queue) reset_repos; do_queue ;;
   pr-comment) reset_repos; do_pr_comment ;;
   autofix) reset_repos; do_autofix ;;
   all)
@@ -362,12 +432,13 @@ case "${1:-help}" in
     do_work
     do_consult
     do_parallel
+    do_queue
     do_pr_comment
     do_autofix
     log "all scenarios passed"
     ;;
   help|--help|-h)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
     ;;
-  *) die "usage: $0 reset|work|consult|parallel|pr-comment|autofix|all" ;;
+  *) die "usage: $0 reset|work|consult|parallel|queue|pr-comment|autofix|all" ;;
 esac

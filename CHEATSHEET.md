@@ -2,7 +2,7 @@
 
 **What it does:** you write an issue on GitHub and add a label; an agent on the server does the rest: code, tests, PR and review. You only answer questions and approve.
 
-**Glossary:** *issue* = a task on GitHub, *label* = a tag that steers the agent (`start`, `consult`), *PR* = the agent's proposed code change, *agent* (pi) = the program writing code on the server.
+**Glossary:** *issue* = a task on GitHub, *label* = a tag that steers the agent (`start`, `consult`, `queue`), *PR* = the agent's proposed code change, *agent* (pi) = the program writing code on the server.
 
 ## Handing over a task (every day)
 
@@ -13,6 +13,8 @@
 3. Add the label **`start`**. Within ~1 min you'll see `agent:working`.
 4. Wait for `agent:ready` and a link to the PR → review the PR.
 5. Write **`/approve`** on the issue. Merge, tag and release happen by themselves.
+
+**Another task already running in the same repo?** Use **`queue`** instead of `start`: it waits and starts by itself once the current one is merged. One agent per repo; other repos still run in parallel.
 
 **Not sure yet?** Use **`consult`** instead of `start`: the agent reads the code and suggests options in comments. Then write “write it up” and add **`start`**.
 
@@ -32,6 +34,7 @@ The agent listens only to you (the `GH_TOKEN` account) and to people in `allow_a
 | Label | Means | You |
 |---|---|---|
 | `agent:consulting` | a discussion, no code | reply in comments |
+| `agent:queued` | waiting for the repo's current task | nothing, it starts by itself |
 | `agent:working` | the agent is working | nothing, wait |
 | `agent:needs-input` | the agent asks something | answer in a comment |
 | `agent:ready` | PR ready, reviewed | review it → `/approve` |
