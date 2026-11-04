@@ -285,6 +285,57 @@ def labeled_by(repo: str, n: int, label: str) -> str:
     return who[-1] if who else ""
 
 
+def task_labels(cfg: dict, kind: str) -> tuple[str, str]:
+    """The GitHub label and the hello comment for an issue task that is about to start."""
+    start = cfg["github"]["start_label"]
+    if kind == "consult":
+        return "agent:consulting", ("🧠 Consulting on this: board task `{id}`. The agent reads the code and answers "
+                                    f"here; it changes nothing. Comment to discuss. Add `{start}` when the issue is ready to build.")
+    return "agent:working", ("🤖 On it: board task `{id}`. Comment here to talk to the agent; "
+                             "PR review comments go to it too.")
+
+
+def describes_issue(desc: str, repo: str, n: int) -> bool:
+    """True when a rendered task description is for exactly repo#n.
+
+    When the task title is longer than 60 chars the board keeps the full title as the description's first
+    paragraph and puts the rendered text after it, so the reference may be on any line, not just the first.
+    The trailing colon makes repo#7 not match repo#70, and the issue URL must be a line of its own.
+    """
+    lines = [l.strip() for l in (desc or "").strip().splitlines()]
+    ref = f"{repo}#{n}:"
+    if not any(l.startswith((f"GitHub issue {ref}", f"Consultation on GitHub issue {ref}")) for l in lines):
+        return False
+    return f"https://github.com/{repo}/issues/{n}" in lines
+
+
+def board_task_for_issue(cfg: dict, repo: str, n: int):
+    """(task_id, kind) of a live board task already made for repo#n, or None.
+
+    bridge.db is not the only memory: a task can exist on the board while its row was lost to a kill or a
+    non-JSON reply between `add` and the insert. The board is asked here so the next poll does not add a
+    second one. `list --query` narrows on the reference, `details` confirms it. A done or archived task never
+    blocks a new one: the query also returns archived tasks, so `archivedAt` is checked as well as `state`.
+    """
+    for t in hp(cfg, "list", "--query", f"{repo}#{n}", check=False):
+        if not isinstance(t, dict) or not t.get("id") or t.get("state") == "done" or t.get("archivedAt"):
+            continue
+        out = hp(cfg, "details", t["id"], check=False)
+        desc = ((out.get("task") or {}).get("description") or "") if isinstance(out, dict) else ""
+        if describes_issue(desc, repo, n):
+            kind = "consult" if any(l.strip().startswith("Consultation on GitHub issue")
+                                    for l in desc.splitlines()) else "work"
+            return t["id"], kind
+    return None
+
+
+def adopt_task(c, repo: str, n: int, task_id: str, kind: str):
+    """Record a board task the bridge has no row for, so labels and comments are handled from now on."""
+    ts = now_iso()
+    c.execute("insert or replace into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
+              " values(?,?,?,?,?,?,?,?,?,?)", (repo, n, task_id, "working", None, ts, ts, ts, "", kind))
+
+
 def start_task(cfg: dict, c, r: dict, i: dict, kind: str):
     repo, n = r["name"], i["number"]
     start, consult = cfg["github"]["start_label"], cfg["consult"]["label"]
@@ -294,19 +345,20 @@ def start_task(cfg: dict, c, r: dict, i: dict, kind: str):
         if cfg["consult"]["agent"]:
             settings += ["--worker.agent", cfg["consult"]["agent"]]
         args = ["--desc", render("consult_from_issue.md", **body), "--chat", "--delegate"]
-        label, hello = "agent:consulting", ("🧠 Consulting on this: board task `{id}`. The agent reads the code and answers "
-                                            f"here; it changes nothing. Comment to discuss. Add `{start}` when the issue is ready to build.")
     else:
         args = ["--desc", render("task_from_issue.md", **body), "--merge.closes", str(n), "--delegate"]
-        label, hello = "agent:working", ("🤖 On it: board task `{id}`. Comment here to talk to the agent; "
-                                         "PR review comments go to it too.")
-    out = hp(cfg, "add", f"{i['title']} (#{n})", "--repo", r["path"], *args, *settings)
+    label, hello = task_labels(cfg, kind)
+    ok, out = hp_result(cfg, "add", f"{i['title']} (#{n})", "--repo", r["path"], *args, *settings)
     task_id = out.get("id") if isinstance(out, dict) else None
-    if not task_id:
+    if not task_id and ok:  # the bare-id fallback is only for a command that succeeded but printed no JSON
         m = re.match(r"(\S+):", out.get("raw", "")) if isinstance(out, dict) else None
         task_id = m.group(1) if m else None
     if not task_id:
-        raise RuntimeError(f"herdr-projects add gave no id: {out}")
+        found = board_task_for_issue(cfg, repo, n)  # `add` may have made the task before it failed
+        if not found:
+            raise RuntimeError(f"herdr-projects add gave no id: {out}")
+        task_id, _ = found
+        log(f"{repo}#{n}: add gave no id; adopted board task {task_id}")
     c.execute("insert or replace into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
               " values(?,?,?,?,?,?,?,?,?,?)", (repo, n, task_id, "working", label, now_iso(), now_iso(), now_iso(), "working/", kind))
     set_label(repo, n, label, also_remove=(start,) if kind == "work" else (consult,))
@@ -340,6 +392,20 @@ def pick_up_issues(cfg: dict, c):
                     comment(repo, n, f"🤖 `{label}` was added by @{who}, who is not on the allowlist. Ignored.")
                     log(f"{repo}#{n}: rejected {label} from {who}")
                     continue
+                if row is None:
+                    found = board_task_for_issue(cfg, repo, n)
+                    if found:  # the board already has this issue's task: track it, never create a second
+                        task_id, found_kind = found
+                        adopt_task(c, repo, n, task_id, found_kind)
+                        log(f"{repo}#{n}: board task {task_id} already exists; skipping the add")
+                        row = active(c, repo, n)
+                        if row and (row["kind"] == kind or kind == "consult"):
+                            # mirror start_task, so an adopted task still labels the issue and greets the human
+                            found_label, hello = task_labels(cfg, found_kind)
+                            set_label(repo, n, found_label,
+                                      also_remove=(start,) if found_kind == "work" else (consult,))
+                            comment(repo, n, hello.format(id=task_id))
+                            continue
                 if row:  # a consult is running and `start` arrived: the issue is ready to build
                     end_consult(cfg, c, row)
                     run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", consult], check=False)

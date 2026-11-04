@@ -1,7 +1,7 @@
 [Unit]
 Description=gh-bridge: GitHub issues -> herdr-projects
+Wants=herdr.service
 After=herdr.service network-online.target
-Requires=herdr.service
 
 [Service]
 Type=simple
