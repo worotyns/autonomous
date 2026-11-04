@@ -489,6 +489,37 @@ class QueueTest(unittest.TestCase):
         self.assertIn("--chat", add)
         self.assertNotIn("--after", add)
 
+    def test_a_queue_moved_to_needs_input_is_not_told_either(self):
+        # Predecessor failed/stopped/archived: no agent ever started, so a `tell` would be refused.
+        self._add_task(issue=2, task_id="T-2", kind="queue", label="agent:needs-input", board_state="blocked/after")
+        with mock.patch.object(bridge, "gh_user", return_value="bot"), \
+             mock.patch.object(bridge, "gh_api") as gh_api, \
+             mock.patch.object(bridge, "hp") as hp, \
+             mock.patch.object(bridge, "run"):
+            self.assertFalse(bridge.deliver_comments(make_cfg(), self.c))
+        gh_api.assert_not_called()
+        hp.assert_not_called()
+
+    def test_a_refused_tell_does_not_block_other_tasks(self):
+        self._add_task(issue=1, task_id="T-1")
+        self._add_task(issue=2, task_id="T-2")
+        comment = {"created_at": "2020-01-02T00:00:00Z", "user": {"login": "alice"}, "body": "look at X"}
+        told = []
+
+        def fake_hp(cfg, *args, **kw):
+            if args[0] == "tell":
+                told.append(args[1])
+                if args[1] == "T-1":
+                    raise RuntimeError("No agent has been on T-1 yet. Delegate it first.")
+            return {"raw": "ok"}
+
+        with mock.patch.object(bridge, "gh_user", return_value="bot"), \
+             mock.patch.object(bridge, "gh_api", return_value=[comment]), \
+             mock.patch.object(bridge, "hp", side_effect=fake_hp), \
+             mock.patch.object(bridge, "run", return_value=""):
+            self.assertTrue(bridge.deliver_comments(self._cfg(), self.c))
+        self.assertEqual(told, ["T-1", "T-2"])
+
     def test_sync_repos_creates_start_queue_and_agent_labels(self):
         with tempfile.TemporaryDirectory() as d:
             Path(d, ".git").mkdir()

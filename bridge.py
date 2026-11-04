@@ -388,33 +388,53 @@ def pick_up_issues(cfg: dict, c):
     return started
 
 
+def waiting_for_start(row) -> bool:
+    """True while the board has not put an agent on this task.
+
+    A queued task waits behind earlier work (stage `after`) or a free slot (stage `queued`). If a task it waits
+    for fails/stops/is archived the board moves it to needs-you, but it still has no agent. A `tell` then either
+    starts it (jumping the queue) or is refused (`No agent has been on … yet`), so its comments must wait too.
+    """
+    stage = (row["board_state"] or "").split("/")[-1]
+    return row["kind"] == "queue" and (row["label"] == "agent:queued" or stage in ("after", "queued"))
+
+
+def deliver_task_comments(cfg: dict, c, row, ok: set[str], quiet: int) -> bool:
+    """Forward one task's new issue comments; moved out of the loop so one refused `tell` cannot stop the rest."""
+    repo, n, tid, cursor = row["repo"], row["issue"], row["task_id"], row["cursor"]
+    new = [x for x in gh_api(f"repos/{repo}/issues/{n}/comments?since={cursor}&per_page=100")
+           if x["created_at"] > cursor and x["user"]["login"].lower() in ok and MARK_PREFIX not in (x["body"] or "")]
+    if not new or age_s(new[-1]["created_at"]) < quiet:  # wait until the human stops typing
+        return False
+    texts, delivered = [], False
+    for x in new:
+        body = x["body"].strip()
+        if body.startswith(("/approve", "/stop")):
+            cmd = "approve" if body.startswith("/approve") else "stop"
+            comment(repo, n, f"🤖 `{tid}`: {said(hp(cfg, cmd, tid, check=False), cmd)}")
+            delivered = True
+        else:
+            texts.append(f"@{x['user']['login']}: {body}")
+    if texts:
+        prompt = "consult_comment.md" if row["kind"] == "consult" else "issue_comment.md"
+        hp(cfg, "tell", tid, render(prompt, repo=repo, number=n, comments="\n\n".join(texts)))
+        log(f"{repo}#{n}: told {tid} {len(texts)} comment(s)")
+        delivered = True
+    c.execute("update tasks set cursor=? where task_id=?", (new[-1]["created_at"], tid))
+    return delivered
+
+
 def deliver_comments(cfg: dict, c):
     ok = allowed(cfg)
     quiet = cfg["bridge"]["quiet_window"]
     delivered = False
     for row in c.execute("select * from tasks where state not in ('done','closed')").fetchall():
-        if row["label"] == "agent:queued":
-            continue  # no agent yet: a `tell` would start the task and jump the queue; deliver these once it starts
-        repo, n, tid, cursor = row["repo"], row["issue"], row["task_id"], row["cursor"]
-        new = [x for x in gh_api(f"repos/{repo}/issues/{n}/comments?since={cursor}&per_page=100")
-               if x["created_at"] > cursor and x["user"]["login"].lower() in ok and MARK_PREFIX not in (x["body"] or "")]
-        if not new or age_s(new[-1]["created_at"]) < quiet:  # wait until the human stops typing
-            continue
-        texts = []
-        for x in new:
-            body = x["body"].strip()
-            if body.startswith(("/approve", "/stop")):
-                cmd = "approve" if body.startswith("/approve") else "stop"
-                comment(repo, n, f"🤖 `{tid}`: {said(hp(cfg, cmd, tid, check=False), cmd)}")
-                delivered = True
-            else:
-                texts.append(f"@{x['user']['login']}: {body}")
-        if texts:
-            prompt = "consult_comment.md" if row["kind"] == "consult" else "issue_comment.md"
-            hp(cfg, "tell", tid, render(prompt, repo=repo, number=n, comments="\n\n".join(texts)))
-            log(f"{repo}#{n}: told {tid} {len(texts)} comment(s)")
-            delivered = True
-        c.execute("update tasks set cursor=? where task_id=?", (new[-1]["created_at"], tid))
+        if waiting_for_start(row):
+            continue  # no agent yet: deliver these once it really starts
+        try:
+            delivered = deliver_task_comments(cfg, c, row, ok, quiet) or delivered
+        except Exception as e:  # one refused tell (a race, a board hiccup) must not block every other task
+            log(f"{row['repo']}#{row['issue']} ({row['task_id']}): comments not delivered: {e}")
     return delivered
 
 
