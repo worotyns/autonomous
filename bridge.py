@@ -298,14 +298,13 @@ def task_labels(cfg: dict, kind: str) -> tuple[str, str]:
 def describes_issue(desc: str, repo: str, n: int) -> bool:
     """True when a rendered task description is for exactly repo#n.
 
-    The title is truncated to 60 chars, but the description's first line keeps the full reference and its
-    second line the issue URL. The trailing colon makes repo#7 not match repo#70.
+    When the task title is longer than 60 chars the board keeps the full title as the description's first
+    paragraph and puts the rendered text after it, so the reference may be on any line, not just the first.
+    The trailing colon makes repo#7 not match repo#70, and the issue URL must be a line of its own.
     """
     lines = [l.strip() for l in (desc or "").strip().splitlines()]
-    if not lines:
-        return False
     ref = f"{repo}#{n}:"
-    if not (lines[0].startswith(f"GitHub issue {ref}") or lines[0].startswith(f"Consultation on GitHub issue {ref}")):
+    if not any(l.startswith((f"GitHub issue {ref}", f"Consultation on GitHub issue {ref}")) for l in lines):
         return False
     return f"https://github.com/{repo}/issues/{n}" in lines
 
@@ -315,15 +314,18 @@ def board_task_for_issue(cfg: dict, repo: str, n: int):
 
     bridge.db is not the only memory: a task can exist on the board while its row was lost to a kill or a
     non-JSON reply between `add` and the insert. The board is asked here so the next poll does not add a
-    second one. `list --query` narrows on the reference, `details` confirms it. Done/archived tasks never block.
+    second one. `list --query` narrows on the reference, `details` confirms it. A done or archived task never
+    blocks a new one: the query also returns archived tasks, so `archivedAt` is checked as well as `state`.
     """
     for t in hp(cfg, "list", "--query", f"{repo}#{n}", check=False):
-        if not isinstance(t, dict) or not t.get("id") or t.get("state") == "done":
+        if not isinstance(t, dict) or not t.get("id") or t.get("state") == "done" or t.get("archivedAt"):
             continue
         out = hp(cfg, "details", t["id"], check=False)
         desc = ((out.get("task") or {}).get("description") or "") if isinstance(out, dict) else ""
         if describes_issue(desc, repo, n):
-            return t["id"], ("consult" if desc.strip().startswith("Consultation on GitHub issue") else "work")
+            kind = "consult" if any(l.strip().startswith("Consultation on GitHub issue")
+                                    for l in desc.splitlines()) else "work"
+            return t["id"], kind
     return None
 
 
@@ -346,9 +348,9 @@ def start_task(cfg: dict, c, r: dict, i: dict, kind: str):
     else:
         args = ["--desc", render("task_from_issue.md", **body), "--merge.closes", str(n), "--delegate"]
     label, hello = task_labels(cfg, kind)
-    _, out = hp_result(cfg, "add", f"{i['title']} (#{n})", "--repo", r["path"], *args, *settings)
+    ok, out = hp_result(cfg, "add", f"{i['title']} (#{n})", "--repo", r["path"], *args, *settings)
     task_id = out.get("id") if isinstance(out, dict) else None
-    if not task_id:
+    if not task_id and ok:  # the bare-id fallback is only for a command that succeeded but printed no JSON
         m = re.match(r"(\S+):", out.get("raw", "")) if isinstance(out, dict) else None
         task_id = m.group(1) if m else None
     if not task_id:
@@ -398,6 +400,11 @@ def pick_up_issues(cfg: dict, c):
                         log(f"{repo}#{n}: board task {task_id} already exists; skipping the add")
                         row = active(c, repo, n)
                         if row and (row["kind"] == kind or kind == "consult"):
+                            # mirror start_task, so an adopted task still labels the issue and greets the human
+                            found_label, hello = task_labels(cfg, found_kind)
+                            set_label(repo, n, found_label,
+                                      also_remove=(start,) if found_kind == "work" else (consult,))
+                            comment(repo, n, hello.format(id=task_id))
                             continue
                 if row:  # a consult is running and `start` arrived: the issue is ready to build
                     end_consult(cfg, c, row)

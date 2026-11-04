@@ -379,6 +379,28 @@ class DuplicateGuardTest(unittest.TestCase):
         start_task.assert_called_once()
         self.assertTrue(started)
 
+    def test_an_archived_board_task_does_not_block_a_new_one(self):
+        def fake_hp(cfg, *args, **kw):
+            self.assertEqual(args[0], "list")  # an archived row needs no details lookup either
+            return [{"id": "a/b/9", "state": "idle", "archivedAt": 1700000000000}]
+
+        started, start_task, _ = self._pick(fake_hp)
+        start_task.assert_called_once()
+        self.assertTrue(started)
+
+    def test_a_title_the_board_truncated_still_matches(self):
+        # over 60 chars: the board keeps the full title as line 0 and moves the reference to line 2
+        def fake_hp(cfg, *args, **kw):
+            if args[0] == "list":
+                return [{"id": "a/b/9", "state": "idle"}]
+            return {"task": {"description":
+                             "A very long issue title the board had to cut at a word (#7)\n\n"
+                             "GitHub issue a/b#7: A very long issue title\n"
+                             "https://github.com/a/b/issues/7\n\nbody\n"}}
+
+        _, start_task, _ = self._pick(fake_hp)
+        start_task.assert_not_called()
+
     def test_a_longer_issue_number_is_not_a_match(self):
         def fake_hp(cfg, *args, **kw):
             if args[0] == "list":
@@ -435,6 +457,23 @@ class StartTaskAdoptTest(unittest.TestCase):
     def test_add_without_an_id_and_no_board_task_raises(self):
         with self.assertRaises(RuntimeError):
             self._start(None)
+
+    def test_a_failed_add_does_not_mistake_its_error_for_an_id(self):
+        # `add` exits 1 with 'worker.agent: no agent program "nonsense-xyz"'; that must not become the id
+        cfg = make_cfg()
+        r = {"name": "a/b", "path": "/nowhere/a/b"}
+        i = {"number": 21, "title": "Add a widget", "html_url": "https://github.com/a/b/issues/21", "body": "x"}
+        with mock.patch.object(bridge, "hp_result",
+                               return_value=(False, {"raw": 'worker.agent: no agent program "nonsense-xyz"'})), \
+             mock.patch.object(bridge, "board_task_for_issue", return_value=None), \
+             mock.patch.object(bridge, "run", return_value=""), \
+             mock.patch.object(bridge, "set_label") as set_label, \
+             mock.patch.object(bridge, "comment") as comment:
+            with self.assertRaises(RuntimeError):
+                bridge.start_task(cfg, self.c, r, i, "work")
+        set_label.assert_not_called()
+        comment.assert_not_called()
+        self.assertIsNone(self.c.execute("select * from tasks").fetchone())
 
 
 class SystemdUnitTest(unittest.TestCase):
