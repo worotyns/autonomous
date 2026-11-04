@@ -19,7 +19,7 @@ import bridge  # noqa: E402
 def make_cfg(**bridge_cfg) -> dict:
     cfg = {
         "bridge": {"poll_interval": 60, "poll_interval_max": 300, "poll_backoff_factor": 1.5, "quiet_window": 90},
-        "github": {"start_label": "start", "allow_authors": []},
+        "github": {"start_label": "start", "queue_label": "queue", "allow_authors": []},
         "consult": {"label": "consult", "agent": ""},
         "repo": [],
     }
@@ -41,6 +41,12 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg["bridge"]["poll_interval_max"], 300)
         self.assertEqual(cfg["bridge"]["poll_backoff_factor"], 1.5)
         self.assertEqual(cfg["bridge"]["auto_recover_max"], 2)
+
+    def test_queue_label_defaults_and_is_configurable(self):
+        cfg = self._load('[[repo]]\nname = "a/b"\n')
+        self.assertEqual(cfg["github"]["queue_label"], "queue")
+        cfg = self._load('[github]\nqueue_label = "later"\n')
+        self.assertEqual(cfg["github"]["queue_label"], "later")
 
     def test_backoff_is_configurable(self):
         cfg = self._load("[bridge]\npoll_interval = 10\npoll_interval_max = 45\npoll_backoff_factor = 2.0\n")
@@ -300,6 +306,200 @@ class FailureHandlingTest(unittest.TestCase):
              mock.patch.object(bridge, "run", return_value=""):
             self.assertTrue(bridge.sync_states(make_cfg(), self.c))
         self.assertEqual(recover, [("fix", "T-1")])
+
+
+class QueueTest(unittest.TestCase):
+    """A `queue` label: wait for the repo's unfinished work on the board, then start by itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_state = bridge.STATE_DIR
+        bridge.STATE_DIR = Path(self.tmp.name)
+        self.c = bridge.db()
+
+    def tearDown(self):
+        self.c.close()
+        bridge.STATE_DIR = self.old_state
+        self.tmp.cleanup()
+
+    def _add_task(self, *, issue=1, task_id="T-1", kind="work", label="agent:working",
+                  board_state="working/working", state="working", repo="a/b"):
+        self.c.execute(
+            "insert into tasks(repo, issue, task_id, state, label, cursor, created_at, updated_at, board_state, kind)"
+            " values(?,?,?,?,?,?,?,?,?,?)",
+            (repo, issue, task_id, state, label, "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z",
+             "2020-01-01T00:00:00Z", board_state, kind))
+
+    @staticmethod
+    def _cfg() -> dict:
+        cfg = make_cfg()
+        cfg["github"]["allow_authors"] = ["alice"]
+        cfg["repo"] = [{"name": "a/b", "path": "/nowhere/a/b"}]
+        return cfg
+
+    @staticmethod
+    def _issue(n: int, *labels: str) -> dict:
+        return {"number": n, "title": f"Issue {n}", "html_url": f"https://example.invalid/{n}",
+                "body": "do it", "labels": [{"name": l} for l in labels]}
+
+    @staticmethod
+    def _api(by_label: dict):
+        def fake(path, *extra, paginate=False):
+            for label, issues in by_label.items():
+                if f"labels={label}" in path:
+                    return issues
+            return []
+        return fake
+
+    def _run_pickup(self, cfg, by_label, *, hp=None, run=None):
+        """Run pick_up_issues with the gh seam mocked; collect hp/run calls when not given a mock."""
+        with mock.patch.object(bridge, "gh_user", return_value="bot"), \
+             mock.patch.object(bridge, "gh_api", side_effect=self._api(by_label)), \
+             mock.patch.object(bridge, "labeled_by", return_value="alice"), \
+             mock.patch.object(bridge, "hp", side_effect=hp) if hp else mock.patch.object(bridge, "hp"), \
+             mock.patch.object(bridge, "run", side_effect=run) if run else mock.patch.object(bridge, "run"):
+            return bridge.pick_up_issues(cfg, self.c)
+
+    def test_queue_with_no_unfinished_work_starts_like_start(self):
+        issue = self._issue(7, "queue")
+        adds = []
+
+        def fake_hp(cfg, *args, **kw):
+            adds.append(args)
+            return {"id": "T-9"}
+
+        self.assertTrue(self._run_pickup(self._cfg(), {"queue": [issue]}, hp=fake_hp))
+        add = next(a for a in adds if a[0] == "add")
+        self.assertNotIn("--after", add)
+        self.assertIn("--delegate", add)
+        row = self.c.execute("select kind, label from tasks where task_id='T-9'").fetchone()
+        self.assertEqual((row["kind"], row["label"]), ("work", "agent:working"))
+
+    def test_queue_with_unfinished_work_waits_behind_it(self):
+        self._add_task(issue=1, task_id="T-1")
+        adds = []
+
+        def fake_hp(cfg, *args, **kw):
+            adds.append(args)
+            return {"id": "T-9"}
+
+        self.assertTrue(self._run_pickup(self._cfg(), {"queue": [self._issue(7, "queue")]}, hp=fake_hp))
+        add = next(a for a in adds if a[0] == "add")
+        self.assertEqual(add[add.index("--after") + 1], "T-1")
+        self.assertIn("--delegate", add)
+        row = self.c.execute("select kind, label from tasks where task_id='T-9'").fetchone()
+        self.assertEqual((row["kind"], row["label"]), ("queue", "agent:queued"))
+
+    def test_a_second_queue_chains_behind_the_first(self):
+        self._add_task(issue=1, task_id="T-1")
+        adds, ids = [], iter(["T-2", "T-3"])
+
+        def fake_hp(cfg, *args, **kw):
+            adds.append(args)
+            return {"id": next(ids)}
+
+        issues = [self._issue(2, "queue"), self._issue(3, "queue")]
+        self._run_pickup(self._cfg(), {"queue": issues}, hp=fake_hp)
+        first, second = [a for a in adds if a[0] == "add"]
+        self.assertEqual(first[first.index("--after") + 1], "T-1")
+        self.assertEqual(second[second.index("--after") + 1], "T-1,T-2")
+
+    def test_sync_states_maps_queue_stages_to_labels(self):
+        self._add_task(issue=1, task_id="T-1", kind="queue", label="agent:working", board_state="other/")
+        for stage, want in (("after", "agent:queued"), ("queued", "agent:queued"), ("working", "agent:working")):
+            with self.subTest(stage=stage):
+                board = [{"id": "T-1", "state": "working", "stage": stage}]
+                with mock.patch.object(bridge, "hp", return_value=board), \
+                     mock.patch.object(bridge, "run", return_value=""):
+                    bridge.sync_states(make_cfg(), self.c)
+                row = self.c.execute("select label from tasks where task_id='T-1'").fetchone()
+                self.assertEqual(row["label"], want)
+
+    def test_a_failed_predecessor_leaves_the_queue_for_the_human(self):
+        self._add_task(issue=1, task_id="T-1", kind="queue", label="agent:queued", board_state="other/")
+        board = [{"id": "T-1", "state": "blocked", "stage": "after", "msg": "T-0 was stopped"}]
+        with mock.patch.object(bridge, "hp", return_value=board), \
+             mock.patch.object(bridge, "run", return_value=""):
+            self.assertTrue(bridge.sync_states(make_cfg(), self.c))
+        row = self.c.execute("select label from tasks where task_id='T-1'").fetchone()
+        self.assertEqual(row["label"], "agent:needs-input")
+
+    def test_comments_are_not_forwarded_while_queued(self):
+        self._add_task(issue=1, task_id="T-1", kind="queue", label="agent:queued")
+        with mock.patch.object(bridge, "gh_user", return_value="bot"), \
+             mock.patch.object(bridge, "gh_api") as gh_api, \
+             mock.patch.object(bridge, "hp") as hp, \
+             mock.patch.object(bridge, "run"):
+            self.assertFalse(bridge.deliver_comments(make_cfg(), self.c))
+        gh_api.assert_not_called()
+        hp.assert_not_called()
+
+    def test_start_wins_over_queue_on_the_same_issue(self):
+        issue = self._issue(7, "start", "queue")
+        adds = []
+
+        def fake_hp(cfg, *args, **kw):
+            adds.append(args)
+            return {"id": "T-9"}
+
+        self._run_pickup(self._cfg(), {"start": [issue], "queue": [issue]}, hp=fake_hp)
+        adds = [a for a in adds if a[0] == "add"]
+        self.assertEqual(len(adds), 1)
+        self.assertNotIn("--after", adds[0])
+
+    def test_start_on_a_queued_issue_delegates_now(self):
+        self._add_task(issue=5, task_id="T-1", kind="queue", label="agent:queued", board_state="working/after")
+        hp_calls, run_calls = [], []
+
+        def fake_hp(cfg, *args, **kw):
+            hp_calls.append(args)
+            return {"raw": "started"}
+
+        def fake_run(args, check=True, input=None):
+            run_calls.append(args)
+            return ""
+
+        issue = self._issue(5, "start")
+        self.assertTrue(self._run_pickup(self._cfg(), {"start": [issue]}, hp=fake_hp, run=fake_run))
+        self.assertIn(("delegate", "T-1", "--now"), hp_calls)
+        row = self.c.execute("select kind, label from tasks where task_id='T-1'").fetchone()
+        self.assertEqual((row["kind"], row["label"]), ("work", "agent:working"))
+        edit = next(a for a in run_calls if a[:3] == ["gh", "issue", "edit"])
+        self.assertIn("agent:working", edit)
+        self.assertIn("start", edit)
+        self.assertIn("queue", edit)
+
+    def test_a_consult_neither_blocks_nor_is_blocked_by_a_queue(self):
+        # A running consult is not unfinished work: a new queue starts at once (no wait).
+        self._add_task(issue=1, task_id="C-1", kind="consult", label="agent:consulting")
+        adds = []
+
+        def fake_hp(cfg, *args, **kw):
+            adds.append(args)
+            return {"id": "T-9"}
+
+        self._run_pickup(self._cfg(), {"queue": [self._issue(7, "queue")]}, hp=fake_hp)
+        add = next(a for a in adds if a[0] == "add")
+        self.assertNotIn("--after", add)
+        # And a queued task does not stop a consult from starting in the same repo.
+        self.c.execute("update tasks set kind='queue', label='agent:queued', board_state='working/after' where task_id='C-1'")
+        adds.clear()
+        self._run_pickup(self._cfg(), {"consult": [self._issue(8, "consult")]}, hp=fake_hp)
+        add = next(a for a in adds if a[0] == "add")
+        self.assertIn("--chat", add)
+        self.assertNotIn("--after", add)
+
+    def test_sync_repos_creates_start_queue_and_agent_labels(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, ".git").mkdir()
+            cfg = make_cfg()
+            cfg["repo"] = [{"name": "a/b", "path": d}]
+            with mock.patch.object(bridge, "run") as run:
+                bridge.cmd_sync_repos(cfg)
+            names = [c.args[0][3] for c in run.call_args_list if c.args[0][:3] == ["gh", "label", "create"]]
+        self.assertIn("start", names)
+        self.assertIn("queue", names)
+        self.assertIn("agent:queued", names)
 
 
 if __name__ == "__main__":

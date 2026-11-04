@@ -121,6 +121,7 @@ sequenceDiagram
 |---|---|
 | talk an idea through before building it | issue + label `consult` → discuss in comments → “write it up” → label `start` |
 | hand over a task | issue from the **Agent task** template (concrete acceptance criteria!) + label `start` |
+| queue behind work already in the same repo | label `queue` instead of `start`: it waits and starts by itself once the task ahead is merged |
 | answer the agent / clarify | comment on the issue |
 | get code changes | comments / review on the PR |
 | merge | `/approve` on the issue (or merge by hand, that works too) |
@@ -131,7 +132,9 @@ sequenceDiagram
 | add a repo | `[[repo]]` in `/etc/autonomous/autonomous.toml` → `sudo autonomous update` |
 | update | `./deploy.sh <host>` again (idempotent, leaves the config in `/etc/autonomous` alone) |
 
-Labels: `agent:consulting` · `agent:working` → (`agent:needs-input`) → `agent:ready` → `agent:done`, or `agent:failed`.
+Labels: `agent:consulting` · `agent:queued` → `agent:working` → (`agent:needs-input`) → `agent:ready` → `agent:done`, or `agent:failed`.
+
+**One agent per repo:** an issue labelled `queue` waits for the repo's current task and starts by itself once it is merged; different repos still run in parallel. Add `start` to a queued issue to start it right away.
 
 **Consult model:** `[consult] agent` in the config or `AUTONOMOUS_CONSULT_AGENT` in `/etc/autonomous/env`, e.g. `pi/openrouter/deepseek/deepseek-v4-pro`. A stronger model than the coding one pays off here: little text, a lot of thinking. The other models (agent, reviewer) are in the `[herdr_projects]` section. `pi --list-models` lists the names.
 
